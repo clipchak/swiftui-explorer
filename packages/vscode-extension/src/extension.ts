@@ -66,12 +66,18 @@ type OpenPreviewResponse = {
   environmentId: string | null;
 };
 
+type AutoRefreshState = {
+  version: string;
+  enabled: boolean;
+};
+
 const LAST_PREVIEW_STATE_KEY = "swiftuiExplorer.lastPreviewSelection";
 
 type ExplorerSnapshot = {
   health: RuntimeHealth;
   inspection: WorkspaceInspection;
   discovery: PreviewTargetDiscovery;
+  autoRefresh: AutoRefreshState;
   selection: OpenPreviewRequest | null;
 };
 
@@ -141,7 +147,9 @@ export function activate(context: vscode.ExtensionContext): void {
       }
 
       try {
-        const refreshedPreview = await refreshPreviewSelection(context, baseUrl, lastPreviewSelection);
+        const refreshedPreview = await refreshPreviewSelection(context, baseUrl, lastPreviewSelection, {
+          progressTitle: "Refreshing SwiftUI preview",
+        });
 
         vscode.window.showInformationMessage(
           `Refreshed ${refreshedPreview.targetId} in ${refreshedPreview.simulatorName}.`,
@@ -200,6 +208,33 @@ export function activate(context: vscode.ExtensionContext): void {
             return;
           }
 
+          if (message.type === "toggleAutoRefresh") {
+            try {
+              const autoRefresh = await postJson<AutoRefreshState>(`${baseUrl}/api/v1/auto-refresh`, {
+                enabled: message.enabled,
+              });
+
+              panel.webview.postMessage({
+                type: "autoRefreshState",
+                enabled: autoRefresh.enabled,
+              });
+              panel.webview.postMessage({
+                type: "previewStatus",
+                kind: "success",
+                text: `Auto-refresh ${autoRefresh.enabled ? "enabled" : "disabled"}.`,
+              });
+            } catch (error) {
+              const messageText = error instanceof Error ? error.message : "Unknown runtime error";
+              panel.webview.postMessage({
+                type: "previewStatus",
+                kind: "error",
+                text: `Could not update auto-refresh: ${messageText}`,
+              });
+            }
+
+            return;
+          }
+
           if (message.type === "refreshPreview") {
             try {
               const lastPreviewSelection = context.globalState.get<OpenPreviewRequest>(LAST_PREVIEW_STATE_KEY);
@@ -242,16 +277,18 @@ async function loadExplorerSnapshot(
   context: vscode.ExtensionContext,
   baseUrl: string,
 ): Promise<ExplorerSnapshot> {
-  const [health, inspection, discovery] = await Promise.all([
+  const [health, inspection, discovery, autoRefresh] = await Promise.all([
     getJson<RuntimeHealth>(`${baseUrl}/health`),
     getJson<WorkspaceInspection>(`${baseUrl}/api/v1/workspace/inspect`),
     getJson<PreviewTargetDiscovery>(`${baseUrl}/api/v1/targets`),
+    getJson<AutoRefreshState>(`${baseUrl}/api/v1/auto-refresh`),
   ]);
 
   return {
     health,
     inspection,
     discovery,
+    autoRefresh,
     selection: normalizeSelection(
       context.globalState.get<OpenPreviewRequest>(LAST_PREVIEW_STATE_KEY),
       discovery.targets,
@@ -325,25 +362,40 @@ async function refreshPreviewSelection(
   context: vscode.ExtensionContext,
   baseUrl: string,
   lastPreviewSelection: OpenPreviewRequest,
+  options?: {
+    progressTitle?: string;
+    showProgress?: boolean;
+    showStatusBar?: boolean;
+  },
 ): Promise<OpenPreviewResponse> {
+  const runRefresh = async (): Promise<OpenPreviewResponse> => {
+    if (options?.showStatusBar) {
+      void vscode.window.setStatusBarMessage("$(sync~spin) Auto-refreshing SwiftUI preview...", 4000);
+    }
+
+    try {
+      return await postJson<OpenPreviewResponse>(`${baseUrl}/api/v1/preview/refresh`, {});
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown runtime error";
+      if (!message.includes("No preview has been opened yet")) {
+        throw error;
+      }
+
+      return openPreviewSelection(context, baseUrl, lastPreviewSelection);
+    }
+  };
+
+  if (options?.showProgress === false) {
+    return runRefresh();
+  }
+
   return vscode.window.withProgress<OpenPreviewResponse>(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "Refreshing SwiftUI preview",
+      title: options?.progressTitle ?? "Refreshing SwiftUI preview",
       cancellable: false,
     },
-    async () => {
-      try {
-        return await postJson<OpenPreviewResponse>(`${baseUrl}/api/v1/preview/refresh`, {});
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Unknown runtime error";
-        if (!message.includes("No preview has been opened yet")) {
-          throw error;
-        }
-
-        return openPreviewSelection(context, baseUrl, lastPreviewSelection);
-      }
-    },
+    async () => runRefresh(),
   );
 }
 
@@ -471,7 +523,7 @@ function renderErrorHtml(baseUrl: string, message: string): string {
 }
 
 function renderPanelHtml(snapshot: ExplorerSnapshot): string {
-  const { health, inspection, discovery, selection } = snapshot;
+  const { health, inspection, discovery, autoRefresh, selection } = snapshot;
   const checkItems: Array<[string, boolean]> = [
     ["Package.swift found", inspection.hasPackageSwift],
     ["Xcode project found", inspection.hasXcodeProject],
@@ -486,6 +538,7 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
   const bootstrapJson = escapeScriptJson(
     JSON.stringify({
       targets: discovery.targets,
+      autoRefresh,
       selection,
     }),
   );
@@ -496,6 +549,15 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
       <p>Scheme: <code>${escapeHtml(discovery.scheme ?? "unknown")}</code></p>
       <p>Manifest: <code>${escapeHtml(discovery.manifestPath ?? "not found")}</code></p>
       <div class="controls">
+        <div class="detailCard">
+          <div class="autoRefreshRow">
+            <div>
+              <strong>Auto-refresh</strong>
+              <div id="autoRefreshStatus" class="status">${autoRefresh.enabled ? "On" : "Off"}</div>
+            </div>
+            <button id="autoRefreshToggle" class="secondary">${autoRefresh.enabled ? "Turn Off" : "Turn On"}</button>
+          </div>
+        </div>
         <label class="field">
           <span>Target</span>
           <select id="targetSelect"></select>
@@ -538,12 +600,15 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
       const bootstrap = bootstrapElement ? JSON.parse(bootstrapElement.textContent || "{}") : {};
       const targets = Array.isArray(bootstrap.targets) ? bootstrap.targets : [];
       const storedSelection = bootstrap.selection || null;
+      let autoRefreshEnabled = !!(bootstrap.autoRefresh && bootstrap.autoRefresh.enabled);
 
       const targetSelect = document.getElementById("targetSelect");
       const fixtureSelect = document.getElementById("fixtureSelect");
       const environmentSelect = document.getElementById("environmentSelect");
       const openButton = document.getElementById("openButton");
       const refreshButton = document.getElementById("refreshButton");
+      const autoRefreshToggle = document.getElementById("autoRefreshToggle");
+      const autoRefreshStatus = document.getElementById("autoRefreshStatus");
       const panelStatus = document.getElementById("panelStatus");
       const targetDetails = document.getElementById("targetDetails");
 
@@ -554,6 +619,17 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
       function setStatus(kind, text) {
         panelStatus.textContent = text;
         panelStatus.className = "status " + kind;
+      }
+
+      function renderAutoRefresh() {
+        if (autoRefreshStatus) {
+          autoRefreshStatus.textContent = autoRefreshEnabled ? 'On' : 'Off';
+          autoRefreshStatus.className = 'status ' + (autoRefreshEnabled ? 'success' : '');
+        }
+
+        if (autoRefreshToggle) {
+          autoRefreshToggle.textContent = autoRefreshEnabled ? 'Turn Off' : 'Turn On';
+        }
       }
 
       function populateTargets() {
@@ -677,6 +753,7 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
           refreshButton.disabled = true;
         }
       }
+      renderAutoRefresh();
 
       targetSelect && targetSelect.addEventListener('change', () => {
         syncAll();
@@ -703,13 +780,30 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
         });
       });
 
+      autoRefreshToggle && autoRefreshToggle.addEventListener('click', () => {
+        const nextEnabled = !autoRefreshEnabled;
+        setStatus('pending', (nextEnabled ? 'Enabling' : 'Disabling') + ' auto-refresh...');
+        vscode.postMessage({
+          type: 'toggleAutoRefresh',
+          enabled: nextEnabled,
+        });
+      });
+
       window.addEventListener('message', (event) => {
         const message = event.data;
-        if (!message || message.type !== 'previewStatus') {
+        if (!message) {
           return;
         }
 
-        setStatus(message.kind === 'error' ? 'error' : 'success', message.text);
+        if (message.type === 'previewStatus') {
+          setStatus(message.kind === 'error' ? 'error' : 'success', message.text);
+          return;
+        }
+
+        if (message.type === 'autoRefreshState') {
+          autoRefreshEnabled = !!message.enabled;
+          renderAutoRefresh();
+        }
       });
     </script>
   `);
@@ -808,6 +902,13 @@ function renderShell(content: string): string {
         margin-top: 0;
         margin-bottom: 8px;
       }
+
+      .autoRefreshRow {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
     </style>
   </head>
   <body>
@@ -863,14 +964,21 @@ function findTargetDisplayName(targets: PreviewDescriptor[], targetId: string): 
 
 function isPanelMessage(
   value: unknown,
-): value is { type: "openPreview"; payload: OpenPreviewRequest } | { type: "refreshPreview" } {
+): value is
+  | { type: "openPreview"; payload: OpenPreviewRequest }
+  | { type: "refreshPreview" }
+  | { type: "toggleAutoRefresh"; enabled: boolean } {
   if (!value || typeof value !== "object" || !("type" in value)) {
     return false;
   }
 
-  const message = value as { type?: unknown; payload?: unknown };
+  const message = value as { type?: unknown; payload?: unknown; enabled?: unknown };
   if (message.type === "refreshPreview") {
     return true;
+  }
+
+  if (message.type === "toggleAutoRefresh") {
+    return typeof message.enabled === "boolean";
   }
 
   if (message.type !== "openPreview" || !message.payload || typeof message.payload !== "object") {

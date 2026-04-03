@@ -1,6 +1,6 @@
 import * as http from "node:http";
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
 
@@ -75,6 +75,15 @@ type PreviewOpenResponse = {
   environmentId: string | null;
 };
 
+type AutoRefreshState = {
+  version: string;
+  enabled: boolean;
+};
+
+type RuntimeState = {
+  autoRefreshEnabled: boolean;
+};
+
 type SimulatorDevice = {
   udid: string;
   name: string;
@@ -104,10 +113,16 @@ const SERVICE = "swiftui-explorer-preview-cli";
 const DEFAULT_PORT = 4123;
 const SAMPLE_APP_BUNDLE_IDENTIFIER = "com.swiftuiexplorer.example.SampleSwiftUIApp";
 const execFileAsync = promisify(execFile);
+const AUTO_REFRESH_DELAY_MS = 600;
 
 const workspaceRoot = process.env.SWIFTUI_EXPLORER_WORKSPACE_ROOT ?? process.cwd();
 const port = Number.parseInt(process.env.SWIFTUI_EXPLORER_PORT ?? `${DEFAULT_PORT}`, 10);
+let runtimeState = loadRuntimeState(workspaceRoot);
 let lastPreviewState: LastPreviewState | null = null;
+let previewWatchers: FSWatcher[] = [];
+let autoRefreshTimer: NodeJS.Timeout | null = null;
+let autoRefreshInFlight = false;
+let pendingAutoRefresh = false;
 
 const server = http.createServer((request, response) => {
   handleRequest(request, response).catch((error: unknown) => {
@@ -144,6 +159,31 @@ async function handleRequest(request: http.IncomingMessage, response: http.Serve
 
   if (request.method === "GET" && requestUrl.pathname === "/api/v1/targets") {
     writeJson<PreviewTargetDiscovery>(response, 200, discoverPreviewTargets(workspaceRoot));
+    return;
+  }
+
+  if (request.method === "GET" && requestUrl.pathname === "/api/v1/auto-refresh") {
+    writeJson<AutoRefreshState>(response, 200, getAutoRefreshStateResponse());
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/v1/auto-refresh") {
+    const body = await readJsonBody<{ enabled?: unknown }>(request);
+    if (typeof body.enabled !== "boolean") {
+      throw new HttpError(400, "enabled must be a boolean.");
+    }
+
+    runtimeState = {
+      ...runtimeState,
+      autoRefreshEnabled: body.enabled,
+    };
+    saveRuntimeState(workspaceRoot, runtimeState);
+
+    process.stdout.write(
+      `[swiftui-explorer] auto-refresh ${runtimeState.autoRefreshEnabled ? "enabled" : "disabled"}\n`,
+    );
+
+    writeJson<AutoRefreshState>(response, 200, getAutoRefreshStateResponse());
     return;
   }
 
@@ -246,6 +286,13 @@ function discoverPreviewTargets(root: string): PreviewTargetDiscovery {
   };
 }
 
+function getAutoRefreshStateResponse(): AutoRefreshState {
+  return {
+    version: VERSION,
+    enabled: runtimeState.autoRefreshEnabled,
+  };
+}
+
 async function openPreview(
   root: string,
   input: PreviewOpenRequest,
@@ -288,6 +335,7 @@ async function openPreview(
     ...(environment?.id ? { environmentId: environment.id } : {}),
     simulatorId: simulator.udid,
   };
+  ensurePreviewWatchers(root);
 
   return {
     version: VERSION,
@@ -324,6 +372,38 @@ function getSampleAppPaths(root: string): {
   };
 }
 
+function getRuntimeStatePath(root: string): string {
+  return path.join(root, ".swiftui-explorer", "runtime-state.json");
+}
+
+function loadRuntimeState(root: string): RuntimeState {
+  const statePath = getRuntimeStatePath(root);
+  if (!existsSync(statePath)) {
+    return {
+      autoRefreshEnabled: true,
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(readFileSync(statePath, "utf8")) as Partial<RuntimeState>;
+    return {
+      autoRefreshEnabled: parsed.autoRefreshEnabled ?? true,
+    };
+  } catch {
+    return {
+      autoRefreshEnabled: true,
+    };
+  }
+}
+
+function saveRuntimeState(root: string, state: RuntimeState): void {
+  const statePath = getRuntimeStatePath(root);
+  mkdirSync(path.dirname(statePath), {
+    recursive: true,
+  });
+  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+}
+
 function readPreviewManifest(manifestPath: string): PreviewManifest | null {
   if (!existsSync(manifestPath)) {
     return null;
@@ -333,6 +413,96 @@ function readPreviewManifest(manifestPath: string): PreviewManifest | null {
     return JSON.parse(readFileSync(manifestPath, "utf8")) as PreviewManifest;
   } catch {
     return null;
+  }
+}
+
+function ensurePreviewWatchers(root: string): void {
+  if (previewWatchers.length > 0) {
+    return;
+  }
+
+  const sampleApp = getSampleAppPaths(root);
+  const watchRoots = [
+    sampleApp.sampleRoot,
+    path.join(root, "packages", "swift-preview-kit"),
+  ].filter(existsSync);
+
+  for (const watchRoot of watchRoots) {
+    const watcher = watch(
+      watchRoot,
+      {
+        recursive: true,
+      },
+      (_eventType, filename) => {
+        if (!filename || !shouldAutoRefreshFromFile(filename.toString())) {
+          return;
+        }
+
+        scheduleAutoRefresh(root, path.join(watchRoot, filename.toString()));
+      },
+    );
+
+    watcher.on("error", (error) => {
+      process.stdout.write(`[swiftui-explorer] watcher error: ${String(error)}\n`);
+    });
+
+    previewWatchers.push(watcher);
+  }
+}
+
+function shouldAutoRefreshFromFile(relativePath: string): boolean {
+  const normalizedPath = relativePath.replaceAll("\\", "/");
+
+  return normalizedPath.endsWith(".swift")
+    || normalizedPath.endsWith("/PreviewManifest.json")
+    || normalizedPath.endsWith("/project.yml")
+    || normalizedPath.endsWith("/project.yaml");
+}
+
+function scheduleAutoRefresh(root: string, changedPath: string): void {
+  if (!runtimeState.autoRefreshEnabled || !lastPreviewState) {
+    return;
+  }
+
+  if (autoRefreshTimer) {
+    clearTimeout(autoRefreshTimer);
+  }
+
+  process.stdout.write(`[swiftui-explorer] scheduled auto-refresh for ${changedPath}\n`);
+
+  autoRefreshTimer = setTimeout(() => {
+    autoRefreshTimer = null;
+    void triggerAutoRefresh(root);
+  }, AUTO_REFRESH_DELAY_MS);
+}
+
+async function triggerAutoRefresh(root: string): Promise<void> {
+  if (!runtimeState.autoRefreshEnabled || !lastPreviewState) {
+    return;
+  }
+
+  if (autoRefreshInFlight) {
+    pendingAutoRefresh = true;
+    return;
+  }
+
+  autoRefreshInFlight = true;
+  pendingAutoRefresh = false;
+  process.stdout.write(`[swiftui-explorer] auto-refreshing ${lastPreviewState.targetId}\n`);
+
+  try {
+    await openPreview(root, lastPreviewState, "refreshed");
+    process.stdout.write(`[swiftui-explorer] auto-refresh completed\n`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown runtime error";
+    process.stdout.write(`[swiftui-explorer] auto-refresh failed: ${message}\n`);
+  } finally {
+    autoRefreshInFlight = false;
+
+    if (pendingAutoRefresh) {
+      pendingAutoRefresh = false;
+      void triggerAutoRefresh(root);
+    }
   }
 }
 
