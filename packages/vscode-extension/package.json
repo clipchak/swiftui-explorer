@@ -16,7 +16,8 @@
     "onCommand:swiftuiExplorer.checkRuntime",
     "onCommand:swiftuiExplorer.openPreview",
     "onCommand:swiftuiExplorer.refreshPreview",
-    "onCommand:swiftuiExplorer.configureHostApp"
+    "onCommand:swiftuiExplorer.configureHostApp",
+    "onCommand:swiftuiExplorer.restartRuntime"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -40,6 +41,10 @@
       {
         "command": "swiftuiExplorer.configureHostApp",
         "title": "SwiftUI Explorer: Configure Host App"
+      },
+      {
+        "command": "swiftuiExplorer.restartRuntime",
+        "title": "SwiftUI Explorer: Restart Runtime"
       }
     ],
     "configuration": {

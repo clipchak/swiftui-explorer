@@ -1,8 +1,15 @@
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { existsSync, readdirSync } from "node:fs";
 import * as http from "node:http";
 import * as https from "node:https";
-import { existsSync } from "node:fs";
 import * as path from "node:path";
+import { promisify } from "node:util";
 import * as vscode from "vscode";
+
+const execFileAsync = promisify(execFile);
+
+let runtimeProcess: ChildProcess | null = null;
+let runtimeOutput: vscode.OutputChannel | null = null;
 
 type RuntimeHealth = {
   version: string;
@@ -97,7 +104,16 @@ type ExplorerSnapshot = {
 };
 
 export function activate(context: vscode.ExtensionContext): void {
+  void ensureRuntimeStarted(context);
+
   context.subscriptions.push(
+    vscode.commands.registerCommand("swiftuiExplorer.restartRuntime", async () => {
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: "Restarting SwiftUI Explorer runtime..." },
+        () => restartRuntime(context),
+      );
+      vscode.window.showInformationMessage("SwiftUI Explorer runtime restarted.");
+    }),
     vscode.commands.registerCommand("swiftuiExplorer.checkRuntime", async () => {
       const baseUrl = getRuntimeBaseUrl();
 
@@ -178,7 +194,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const baseUrl = getRuntimeBaseUrl();
 
       try {
-        const configuredHostApp = await promptForHostAppConfiguration(baseUrl);
+        const configuredHostApp = await promptForHostAppConfiguration(context, baseUrl);
         if (!configuredHostApp) {
           return;
         }
@@ -188,7 +204,7 @@ export function activate(context: vscode.ExtensionContext): void {
         );
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown runtime error";
-        vscode.window.showWarningMessage(`Could not configure host app: ${message}`);
+        void offerRuntimeRestart(context, `Could not configure host app: ${message}`);
       }
     }),
     vscode.commands.registerCommand("swiftuiExplorer.openPanel", async () => {
@@ -206,6 +222,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const baseUrl = getRuntimeBaseUrl();
 
       try {
+        await ensureRuntimeReady(context);
         let snapshot = await loadExplorerSnapshot(context, baseUrl);
         panel.webview.html = renderPanelHtml(snapshot);
 
@@ -242,7 +259,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
           if (message.type === "configureHostApp") {
             try {
-              const configuredHostApp = await promptForHostAppConfiguration(baseUrl);
+              const configuredHostApp = await promptForHostAppConfiguration(context, baseUrl);
               if (!configuredHostApp) {
                 panel.webview.postMessage({
                   type: "previewStatus",
@@ -261,6 +278,7 @@ export function activate(context: vscode.ExtensionContext): void {
                 kind: "error",
                 text: `Could not configure host app: ${messageText}`,
               });
+              void offerRuntimeRestart(context, `Could not configure host app: ${messageText}`);
             }
 
             return;
@@ -324,12 +342,182 @@ export function activate(context: vscode.ExtensionContext): void {
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown runtime error";
         panel.webview.html = renderErrorHtml(baseUrl, message);
+        void offerRuntimeRestart(context, `Could not load explorer panel: ${message}`);
       }
     }),
   );
 }
 
-export function deactivate(): void {}
+export function deactivate(): void {
+  if (runtimeProcess) {
+    runtimeProcess.kill("SIGTERM");
+    runtimeProcess = null;
+  }
+  runtimeOutput?.dispose();
+  runtimeOutput = null;
+}
+
+function resolveWorkspaceRoot(context: vscode.ExtensionContext): string | undefined {
+  const fromWorkspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (fromWorkspace) {
+    return fromWorkspace;
+  }
+
+  const fromExtensionPath = path.resolve(context.extensionPath, "..", "..");
+  if (existsSync(path.join(fromExtensionPath, "package.json"))) {
+    return fromExtensionPath;
+  }
+
+  return undefined;
+}
+
+function getRuntimeEntryPath(extensionPath: string): string {
+  return path.join(extensionPath, "..", "preview-cli", "dist", "index.js");
+}
+
+function getRuntimePort(): string {
+  const baseUrl = getRuntimeBaseUrl();
+  try {
+    return new URL(baseUrl).port || "4123";
+  } catch {
+    return "4123";
+  }
+}
+
+async function isRuntimeReachable(): Promise<boolean> {
+  try {
+    await getJson<RuntimeHealth>(`${getRuntimeBaseUrl()}/health`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureRuntimeStarted(context: vscode.ExtensionContext): Promise<void> {
+  if (await isRuntimeReachable()) {
+    return;
+  }
+
+  const failReason = await spawnRuntime(context);
+  if (failReason) {
+    runtimeOutput?.appendLine(`[extension] auto-start failed: ${failReason}`);
+  }
+}
+
+async function spawnRuntime(context: vscode.ExtensionContext): Promise<string | null> {
+  if (!runtimeOutput) {
+    runtimeOutput = vscode.window.createOutputChannel("SwiftUI Explorer Runtime");
+  }
+
+  const entryPath = getRuntimeEntryPath(context.extensionPath);
+  runtimeOutput.appendLine(`[extension] looking for runtime at: ${entryPath}`);
+
+  if (!existsSync(entryPath)) {
+    const reason = `Runtime entry not found at ${entryPath}. Run 'npm run build' in the workspace root.`;
+    runtimeOutput.appendLine(`[extension] ${reason}`);
+    return reason;
+  }
+
+  const workspaceRoot = resolveWorkspaceRoot(context);
+  if (!workspaceRoot) {
+    const reason = "Could not determine workspace root.";
+    runtimeOutput.appendLine(`[extension] ${reason}`);
+    return reason;
+  }
+
+  runtimeOutput.appendLine(`[extension] workspace root: ${workspaceRoot}`);
+
+  await killProcessOnPort(getRuntimePort());
+  await delay(300);
+
+  runtimeProcess = spawn("node", [entryPath], {
+    cwd: workspaceRoot,
+    env: { ...process.env, SWIFTUI_EXPLORER_WORKSPACE_ROOT: workspaceRoot },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  runtimeProcess.stdout?.on("data", (data: Buffer) => {
+    runtimeOutput?.append(data.toString());
+  });
+  runtimeProcess.stderr?.on("data", (data: Buffer) => {
+    runtimeOutput?.append(data.toString());
+  });
+  runtimeProcess.on("exit", (code) => {
+    runtimeOutput?.appendLine(`[runtime exited with code ${code}]`);
+    runtimeProcess = null;
+  });
+
+  for (let attempt = 0; attempt < 20; attempt++) {
+    await delay(250);
+    if (await isRuntimeReachable()) {
+      runtimeOutput.appendLine("[extension] runtime is healthy");
+      return null;
+    }
+  }
+
+  return "Runtime process started but did not become healthy within 5 seconds.";
+}
+
+async function stopRuntime(): Promise<void> {
+  if (runtimeProcess) {
+    runtimeProcess.kill("SIGTERM");
+    runtimeProcess = null;
+  }
+
+  await killProcessOnPort(getRuntimePort());
+}
+
+async function killProcessOnPort(port: string): Promise<void> {
+  try {
+    const { stdout } = await execFileAsync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]);
+    for (const pid of stdout.trim().split("\n").filter(Boolean)) {
+      try {
+        await execFileAsync("kill", [pid]);
+      } catch {
+        // already dead
+      }
+    }
+  } catch {
+    // nothing listening
+  }
+}
+
+async function restartRuntime(context: vscode.ExtensionContext): Promise<string | null> {
+  await stopRuntime();
+  await delay(500);
+  return spawnRuntime(context);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function ensureRuntimeReady(context: vscode.ExtensionContext): Promise<void> {
+  if (await isRuntimeReachable()) {
+    return;
+  }
+
+  const failReason = await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: "Starting SwiftUI Explorer runtime..." },
+    () => spawnRuntime(context),
+  );
+
+  if (failReason) {
+    runtimeOutput?.show(true);
+    throw new Error(failReason);
+  }
+}
+
+async function offerRuntimeRestart(context: vscode.ExtensionContext, errorMessage: string): Promise<void> {
+  const action = await vscode.window.showErrorMessage(errorMessage, "Restart Runtime");
+  if (action === "Restart Runtime") {
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: "Restarting SwiftUI Explorer runtime..." },
+      () => restartRuntime(context),
+    );
+    vscode.window.showInformationMessage("SwiftUI Explorer runtime restarted. Try your action again.");
+  }
+}
 
 async function loadExplorerSnapshot(
   context: vscode.ExtensionContext,
@@ -356,7 +544,7 @@ async function loadExplorerSnapshot(
   };
 }
 
-async function promptForHostAppConfiguration(baseUrl: string): Promise<HostAppConfiguration | undefined> {
+async function promptForHostAppConfiguration(context: vscode.ExtensionContext, baseUrl: string): Promise<HostAppConfiguration | undefined> {
   const workspaceUri = vscode.workspace.workspaceFolders?.[0]?.uri;
   const appRootUri = await pickSingleUri({
     canSelectFiles: false,
@@ -370,49 +558,30 @@ async function promptForHostAppConfiguration(baseUrl: string): Promise<HostAppCo
     return undefined;
   }
 
-  const buildContainerUri = await pickSingleUri({
-    canSelectFiles: true,
-    canSelectFolders: false,
-    canSelectMany: false,
-    defaultUri: appRootUri,
-    openLabel: "Select Project or Workspace",
-    title: "Select Xcode Project or Workspace",
-    filters: {
-      "Xcode Project or Workspace": ["xcodeproj", "xcworkspace"],
-    },
-  });
-  if (!buildContainerUri) {
+  const buildContainer = await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: "Scanning for Xcode projects..." },
+    () => detectAndPickBuildContainer(appRootUri.fsPath),
+  );
+  if (!buildContainer) {
     return undefined;
   }
 
-  const manifestUri = await pickSingleUri({
-    canSelectFiles: true,
-    canSelectFolders: false,
-    canSelectMany: false,
-    defaultUri: appRootUri,
-    openLabel: "Select Preview Manifest",
-    title: "Select Preview Manifest",
-    filters: {
-      JSON: ["json"],
-    },
-  });
-  if (!manifestUri) {
-    return undefined;
-  }
-
-  const scheme = await vscode.window.showInputBox({
-    title: "SwiftUI Explorer Scheme",
-    prompt: "Enter the Xcode scheme to build for previews.",
-    ignoreFocusOut: true,
-    validateInput: (value) => value.trim() ? undefined : "Scheme is required.",
-  });
+  const scheme = await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: "Detecting Xcode schemes..." },
+    () => detectAndPickScheme(buildContainer),
+  );
   if (!scheme) {
     return undefined;
   }
 
+  const detectedBundleId = await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: "Reading build settings..." },
+    () => detectBundleIdentifier(buildContainer, scheme),
+  );
   const bundleIdentifier = await vscode.window.showInputBox({
     title: "SwiftUI Explorer Bundle Identifier",
-    prompt: "Enter the app bundle identifier used to launch the host app in Simulator.",
+    prompt: "Confirm or edit the app bundle identifier used to launch in Simulator.",
+    value: detectedBundleId ?? "",
     ignoreFocusOut: true,
     validateInput: (value) => value.trim() ? undefined : "Bundle identifier is required.",
   });
@@ -426,16 +595,126 @@ async function promptForHostAppConfiguration(baseUrl: string): Promise<HostAppCo
 
   const input = {
     appRoot: appRootUri.fsPath,
-    ...(buildContainerUri.fsPath.endsWith(".xcworkspace")
-      ? { workspacePath: buildContainerUri.fsPath }
-      : { projectPath: buildContainerUri.fsPath }),
+    ...(buildContainer.endsWith(".xcworkspace")
+      ? { workspacePath: buildContainer }
+      : { projectPath: buildContainer }),
     ...(detectedXcodeGenSpecPath ? { xcodeGenSpecPath: detectedXcodeGenSpecPath } : {}),
     scheme: scheme.trim(),
-    manifestPath: manifestUri.fsPath,
     bundleIdentifier: bundleIdentifier.trim(),
   };
 
-  return postJson<HostAppConfiguration>(`${baseUrl}/api/v1/config`, input);
+  await ensureRuntimeReady(context);
+
+  return vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: "Saving host app configuration..." },
+    () => postJson<HostAppConfiguration>(`${baseUrl}/api/v1/config`, input),
+  );
+}
+
+async function detectAndPickBuildContainer(appRoot: string): Promise<string | undefined> {
+  const entries = readdirSync(appRoot, { withFileTypes: true });
+  const candidates = entries
+    .filter((entry) => entry.isDirectory() && (entry.name.endsWith(".xcodeproj") || entry.name.endsWith(".xcworkspace")))
+    .map((entry) => ({
+      name: entry.name,
+      fullPath: path.join(appRoot, entry.name),
+      isWorkspace: entry.name.endsWith(".xcworkspace"),
+    }));
+
+  if (candidates.length === 0) {
+    vscode.window.showWarningMessage("No .xcodeproj or .xcworkspace found in the selected directory.");
+    return undefined;
+  }
+
+  if (candidates.length === 1) {
+    return candidates[0].fullPath;
+  }
+
+  const selection = await vscode.window.showQuickPick(
+    candidates.map((candidate) => ({
+      label: candidate.name,
+      description: candidate.isWorkspace ? "Workspace" : "Project",
+      fullPath: candidate.fullPath,
+    })),
+    {
+      title: "Select Xcode Project or Workspace",
+      ignoreFocusOut: true,
+    },
+  );
+
+  return selection?.fullPath;
+}
+
+async function detectAndPickScheme(buildContainerPath: string): Promise<string | undefined> {
+  const isWorkspace = buildContainerPath.endsWith(".xcworkspace");
+  const flag = isWorkspace ? "-workspace" : "-project";
+
+  try {
+    const { stdout } = await execFileAsync("xcodebuild", [flag, buildContainerPath, "-list"], {
+      timeout: 15000,
+    });
+
+    const schemes: string[] = [];
+    let inSchemes = false;
+    for (const line of stdout.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed === "Schemes:") {
+        inSchemes = true;
+        continue;
+      }
+      if (inSchemes) {
+        if (!trimmed || trimmed.endsWith(":")) {
+          break;
+        }
+        schemes.push(trimmed);
+      }
+    }
+
+    if (schemes.length === 1) {
+      return schemes[0];
+    }
+
+    if (schemes.length > 1) {
+      const selection = await vscode.window.showQuickPick(
+        schemes.map((name) => ({ label: name })),
+        { title: "Select Xcode Scheme", ignoreFocusOut: true },
+      );
+      return selection?.label;
+    }
+  } catch {
+    // xcodebuild -list failed — fall through to manual input
+  }
+
+  return vscode.window.showInputBox({
+    title: "SwiftUI Explorer Scheme",
+    prompt: "Could not detect schemes automatically. Enter the Xcode scheme to build.",
+    ignoreFocusOut: true,
+    validateInput: (value) => (value.trim() ? undefined : "Scheme is required."),
+  });
+}
+
+async function detectBundleIdentifier(buildContainerPath: string, scheme: string): Promise<string | null> {
+  const isWorkspace = buildContainerPath.endsWith(".xcworkspace");
+  const flag = isWorkspace ? "-workspace" : "-project";
+
+  try {
+    const { stdout } = await execFileAsync(
+      "xcodebuild",
+      [flag, buildContainerPath, "-scheme", scheme, "-showBuildSettings"],
+      { timeout: 30000 },
+    );
+
+    for (const line of stdout.split("\n")) {
+      const match = line.match(/^\s*PRODUCT_BUNDLE_IDENTIFIER\s*=\s*(.+)$/);
+      if (match) {
+        return match[1].trim();
+      }
+    }
+  } catch {
+    // fall through
+  }
+
+  return null;
 }
 
 async function pickSingleUri(options: vscode.OpenDialogOptions): Promise<vscode.Uri | undefined> {
@@ -695,7 +974,7 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
       <p>${buildContainerLabel}</p>
       <p>Scheme: <code>${escapeHtml(hostAppConfiguration.scheme)}</code></p>
       <p>Bundle ID: <code>${escapeHtml(hostAppConfiguration.bundleIdentifier)}</code></p>
-      <p>Manifest: <code>${escapeHtml(hostAppConfiguration.manifestPath)}</code></p>
+      <p>Manifest (auto-detected): <code>${escapeHtml(hostAppConfiguration.manifestPath)}</code></p>
       <p>XcodeGen: <code>${escapeHtml(hostAppConfiguration.xcodeGenSpecPath ?? "not configured")}</code></p>
     </div>
   `;

@@ -63,9 +63,9 @@ Persists a host app configuration. The request must include:
 - `appRoot`
 - exactly one of `projectPath` or `workspacePath`
 - `scheme`
-- `manifestPath`
 - `bundleIdentifier`
 - optional `xcodeGenSpecPath`
+- optional `manifestPath` (auto-detected if omitted — the runtime scans the app root for `PreviewManifest.json` and checks `.swiftui-explorer/manifests/<scheme>.json`)
 
 ### `GET /api/v1/auto-refresh`
 
@@ -75,12 +75,21 @@ Returns whether runtime-owned auto-refresh is currently enabled.
 
 Updates the persisted runtime-owned auto-refresh state.
 
+## Manifest Discovery
+
+The runtime auto-detects the preview manifest rather than requiring users to locate it manually.
+
+Search order:
+
+1. **Cached manifest**: `.swiftui-explorer/manifests/<scheme>.json` — written by the host app on each launch via the `SWIFTUI_EXPLORER_MANIFEST_OUTPUT` environment variable.
+2. **Source-tree scan**: walks the app root (up to 4 levels) looking for a file named `PreviewManifest.json`.
+3. **Fallback**: uses the cached path from step 1 (will be created on the next build+launch cycle).
+
+Host apps that integrate `SwiftPreviewKit` should define preview targets in their `PreviewRegistry` implementation and generate the manifest from the registry (see `SamplePreviewManifest` in the sample app). The runtime passes `SWIFTUI_EXPLORER_MANIFEST_OUTPUT` as a `SIMCTL_CHILD_` environment variable at launch, so the app writes the manifest to the expected cache location automatically.
+
 ## Expected Near-Term Additions
 
 - `POST /api/v1/session/start`
-- `POST /api/v1/preview/open`
-- `POST /api/v1/preview/refresh`
-- `GET /api/v1/targets`
 - `POST /api/v1/capture/snapshot`
 
 ## Design Constraints
@@ -88,3 +97,4 @@ Updates the persisted runtime-owned auto-refresh state.
 - The extension should never shell out to `xcodebuild` directly.
 - The runtime should own all simulator process control.
 - Host apps should only need to implement the Swift preview registry contract, not editor-specific code.
+- Users should never need to manually author or select `PreviewManifest.json` — the manifest is generated from Swift code and auto-detected by the runtime.

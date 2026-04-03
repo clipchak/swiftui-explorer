@@ -20,7 +20,7 @@ The repo is bootstrapped around the first MVP slice:
 - a Swift package that defines the first preview registration contract,
 - and an in-repo sample SwiftUI host app scaffolded under `examples/sample-swiftui-app`.
 
-The runtime now defaults to the sample app, but the explorer can also be pointed at a custom host app project or workspace through the `Configure Host App` command or panel button.
+The runtime now defaults to the sample app, but the explorer can also be pointed at a custom host app project or workspace through the `Configure Host App` command or panel button. The preview manifest is auto-generated from the Swift `PreviewRegistry` and auto-detected by the runtime — users never need to manually author or select `PreviewManifest.json`.
 
 ## First Build Steps
 
@@ -35,6 +35,13 @@ For the Swift package:
 cd packages/swift-preview-kit
 swift test
 ```
+
+## Integrating a Host App
+
+1. Add `SwiftPreviewKit` as a dependency to your app.
+2. Create a `PreviewRegistry` that defines your preview targets inline (see `SamplePreviewRegistry`).
+3. In your app's `init()`, generate and write the manifest using `PreviewRegistry.manifest(appName:scheme:)` when `SWIFTUI_EXPLORER_MANIFEST_OUTPUT` is set.
+4. Use `Configure Host App` in the explorer panel — you only need to provide the app root, project/workspace, scheme, and bundle ID. The manifest is discovered automatically.
 
 ## MVP Direction
 

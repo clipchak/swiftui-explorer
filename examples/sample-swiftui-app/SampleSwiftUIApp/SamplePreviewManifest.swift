@@ -2,16 +2,23 @@ import Foundation
 import SwiftPreviewKit
 
 enum SamplePreviewManifest {
-    static func load() -> PreviewManifest {
-        guard let url = Bundle.main.url(forResource: "PreviewManifest", withExtension: "json") else {
-            fatalError("Missing PreviewManifest.json in sample app bundle.")
+    static func generate(from registry: some SwiftPreviewKit.PreviewRegistry) -> PreviewManifest {
+        registry.manifest(appName: SamplePreviewRegistry.appName, scheme: SamplePreviewRegistry.scheme)
+    }
+
+    static func write(_ manifest: PreviewManifest, to outputPath: String) {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+
+        guard let data = try? encoder.encode(manifest) else {
+            return
         }
 
-        do {
-            let data = try Data(contentsOf: url)
-            return try JSONDecoder().decode(PreviewManifest.self, from: data)
-        } catch {
-            fatalError("Failed to load sample preview manifest: \(error)")
-        }
+        let url = URL(fileURLWithPath: outputPath)
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? data.write(to: url)
     }
 }

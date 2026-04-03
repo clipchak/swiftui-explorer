@@ -108,7 +108,7 @@ type PersistedHostAppConfiguration = {
   workspacePath?: string;
   xcodeGenSpecPath?: string;
   scheme: string;
-  manifestPath: string;
+  manifestPath?: string;
   bundleIdentifier: string;
 };
 
@@ -414,11 +414,12 @@ async function openPreview(
   await ensureSimulatorBooted(simulator.udid);
   await focusSimulatorApp(simulator.udid);
   const appPath = await buildHostApp(hostApp, root, hostApp.scheme, simulator.udid, manifest.appName);
+  const manifestOutputPath = getManifestCachePath(root, hostApp.scheme);
   await installAndLaunchHostApp(hostApp.bundleIdentifier, appPath, simulator.udid, {
     targetId: target.id,
     fixtureId: fixture?.id ?? null,
     environmentId: environment?.id ?? null,
-  });
+  }, manifestOutputPath);
   await focusSimulatorApp(simulator.udid);
 
   lastPreviewState = {
@@ -445,6 +446,7 @@ async function openPreview(
 
 function getDefaultHostAppConfiguration(root: string): ResolvedHostAppConfiguration {
   const appRoot = path.join(root, "examples", "sample-swiftui-app");
+  const scheme = "SampleSwiftUIApp";
 
   return {
     usingDefault: true,
@@ -452,8 +454,8 @@ function getDefaultHostAppConfiguration(root: string): ResolvedHostAppConfigurat
     projectPath: path.join(appRoot, "SampleSwiftUIApp.xcodeproj"),
     workspacePath: null,
     xcodeGenSpecPath: path.join(appRoot, "project.yml"),
-    scheme: "SampleSwiftUIApp",
-    manifestPath: path.join(appRoot, "SampleSwiftUIApp", "Resources", "PreviewManifest.json"),
+    scheme,
+    manifestPath: detectManifestPath(root, appRoot, scheme),
     bundleIdentifier: "com.swiftuiexplorer.example.SampleSwiftUIApp",
     derivedDataPath: path.join(root, ".swiftui-explorer", "derived-data", "sample-swiftui-app"),
   };
@@ -501,10 +503,6 @@ function validateHostAppConfigurationInput(input: HostAppConfigurationInput): Pe
     throw new HttpError(400, "scheme is required.");
   }
 
-  if (typeof input.manifestPath !== "string" || !input.manifestPath.trim()) {
-    throw new HttpError(400, "manifestPath is required.");
-  }
-
   if (typeof input.bundleIdentifier !== "string" || !input.bundleIdentifier.trim()) {
     throw new HttpError(400, "bundleIdentifier is required.");
   }
@@ -519,13 +517,17 @@ function validateHostAppConfigurationInput(input: HostAppConfigurationInput): Pe
     ? input.xcodeGenSpecPath
     : undefined;
 
+  const manifestPath = typeof input.manifestPath === "string" && input.manifestPath.trim()
+    ? input.manifestPath.trim()
+    : undefined;
+
   return {
     appRoot: input.appRoot.trim(),
     projectPath,
     workspacePath,
     xcodeGenSpecPath,
     scheme: input.scheme.trim(),
-    manifestPath: input.manifestPath.trim(),
+    ...(manifestPath ? { manifestPath } : {}),
     bundleIdentifier: input.bundleIdentifier.trim(),
   };
 }
@@ -537,7 +539,7 @@ function persistHostAppConfiguration(root: string, configuration: PersistedHostA
     ...(configuration.workspacePath ? { workspacePath: toStoredPath(root, configuration.workspacePath) } : {}),
     ...(configuration.xcodeGenSpecPath ? { xcodeGenSpecPath: toStoredPath(root, configuration.xcodeGenSpecPath) } : {}),
     scheme: configuration.scheme,
-    manifestPath: toStoredPath(root, configuration.manifestPath),
+    ...(configuration.manifestPath ? { manifestPath: toStoredPath(root, configuration.manifestPath) } : {}),
     bundleIdentifier: configuration.bundleIdentifier,
   };
 }
@@ -548,7 +550,6 @@ function resolveHostAppConfiguration(root: string): ResolvedHostAppConfiguration
     !configured
     || !configured.appRoot
     || !configured.scheme
-    || !configured.manifestPath
     || !configured.bundleIdentifier
     || ((!configured.projectPath ? 0 : 1) + (!configured.workspacePath ? 0 : 1) !== 1)
   ) {
@@ -560,6 +561,9 @@ function resolveHostAppConfiguration(root: string): ResolvedHostAppConfiguration
   const workspacePath = configured.workspacePath ? resolveWorkspacePath(root, configured.workspacePath) : null;
   const xcodeGenSpecPath = configured.xcodeGenSpecPath ? resolveWorkspacePath(root, configured.xcodeGenSpecPath) : null;
   const derivedDataKey = slugify(`${path.basename(appRoot)}-${configured.scheme}`);
+  const manifestPath = configured.manifestPath
+    ? resolveWorkspacePath(root, configured.manifestPath)
+    : detectManifestPath(root, appRoot, configured.scheme);
 
   return {
     usingDefault: false,
@@ -568,7 +572,7 @@ function resolveHostAppConfiguration(root: string): ResolvedHostAppConfiguration
     workspacePath,
     xcodeGenSpecPath,
     scheme: configured.scheme,
-    manifestPath: resolveWorkspacePath(root, configured.manifestPath),
+    manifestPath,
     bundleIdentifier: configured.bundleIdentifier,
     derivedDataPath: path.join(root, ".swiftui-explorer", "derived-data", derivedDataKey),
   };
@@ -591,6 +595,26 @@ function toStoredPath(root: string, candidatePath: string): string {
 
 function slugify(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase() || "host-app";
+}
+
+function getManifestCachePath(root: string, scheme: string): string {
+  return path.join(root, ".swiftui-explorer", "manifests", `${scheme}.json`);
+}
+
+function detectManifestPath(root: string, appRoot: string, scheme: string): string {
+  const cachedPath = getManifestCachePath(root, scheme);
+  if (existsSync(cachedPath)) {
+    return cachedPath;
+  }
+
+  const found = walk(appRoot, 4).find(
+    (entry) => entry.endsWith(`${path.sep}PreviewManifest.json`) || entry.endsWith("/PreviewManifest.json"),
+  );
+  if (found) {
+    return found;
+  }
+
+  return cachedPath;
 }
 
 function readPreviewManifest(manifestPath: string): PreviewManifest | null {
@@ -898,6 +922,7 @@ async function installAndLaunchHostApp(
     fixtureId: string | null;
     environmentId: string | null;
   },
+  manifestOutputPath: string,
 ): Promise<void> {
   await runCommand("xcrun", ["simctl", "install", simulatorId, appPath], workspaceRoot);
 
@@ -910,6 +935,7 @@ async function installAndLaunchHostApp(
         SIMCTL_CHILD_SWIFTUI_EXPLORER_TARGET_ID: selection.targetId,
         ...(selection.fixtureId ? { SIMCTL_CHILD_SWIFTUI_EXPLORER_FIXTURE_ID: selection.fixtureId } : {}),
         ...(selection.environmentId ? { SIMCTL_CHILD_SWIFTUI_EXPLORER_ENVIRONMENT_ID: selection.environmentId } : {}),
+        SIMCTL_CHILD_SWIFTUI_EXPLORER_MANIFEST_OUTPUT: manifestOutputPath,
       },
     },
   );
