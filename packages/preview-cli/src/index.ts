@@ -14,6 +14,7 @@ type WorkspaceInspection = {
   hasPackageSwift: boolean;
   hasXcodeProject: boolean;
   hasWorkspace: boolean;
+  hasXcodeGenSpec: boolean;
   suggestedNextAction: string;
 };
 
@@ -55,6 +56,7 @@ function inspectWorkspace(root: string): WorkspaceInspection {
   const hasPackageSwift = fileExists(root, "Package.swift");
   const hasXcodeProject = hasPathSuffix(root, ".xcodeproj");
   const hasWorkspace = hasPathSuffix(root, ".xcworkspace");
+  const hasXcodeGenSpec = fileExists(path.join(root, "examples", "sample-swiftui-app"), "project.yml");
 
   return {
     version: VERSION,
@@ -62,10 +64,12 @@ function inspectWorkspace(root: string): WorkspaceInspection {
     hasPackageSwift,
     hasXcodeProject,
     hasWorkspace,
+    hasXcodeGenSpec,
     suggestedNextAction: suggestNextAction({
       hasPackageSwift,
       hasXcodeProject,
       hasWorkspace,
+      hasXcodeGenSpec,
     }),
   };
 }
@@ -74,7 +78,12 @@ function suggestNextAction(input: {
   hasPackageSwift: boolean;
   hasXcodeProject: boolean;
   hasWorkspace: boolean;
+  hasXcodeGenSpec: boolean;
 }): string {
+  if (input.hasXcodeGenSpec && !input.hasXcodeProject && !input.hasWorkspace) {
+    return "Generate the sample app project with XcodeGen, then point the runtime at that app target.";
+  }
+
   if (!input.hasXcodeProject && !input.hasWorkspace) {
     return "Add a sample SwiftUI host app or point the runtime at an existing app workspace.";
   }

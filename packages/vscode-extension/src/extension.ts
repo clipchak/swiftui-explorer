@@ -14,6 +14,7 @@ type WorkspaceInspection = {
   hasPackageSwift: boolean;
   hasXcodeProject: boolean;
   hasWorkspace: boolean;
+  hasXcodeGenSpec: boolean;
   suggestedNextAction: string;
 };
 
@@ -127,6 +128,7 @@ function renderPanelHtml(health: RuntimeHealth, inspection: WorkspaceInspection)
     ["Package.swift found", inspection.hasPackageSwift],
     ["Xcode project found", inspection.hasXcodeProject],
     ["Xcode workspace found", inspection.hasWorkspace],
+    ["XcodeGen spec found", inspection.hasXcodeGenSpec],
   ];
 
   const checks = checkItems

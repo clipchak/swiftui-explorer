@@ -33,7 +33,8 @@ Returns the runtime's view of the current workspace:
   "hasPackageSwift": false,
   "hasXcodeProject": false,
   "hasWorkspace": false,
-  "suggestedNextAction": "Add a sample SwiftUI host app or point the runtime at an existing app workspace."
+  "hasXcodeGenSpec": true,
+  "suggestedNextAction": "Generate the sample app project with XcodeGen, then point the runtime at that app target."
 }
 ```
 

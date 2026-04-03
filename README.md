@@ -17,7 +17,8 @@ The repo is bootstrapped around the first MVP slice:
 - a TypeScript workspace root,
 - a minimal extension that opens a SwiftUI Explorer panel,
 - a local runtime with health and workspace inspection endpoints,
-- and a Swift package that defines the first preview registration contract.
+- a Swift package that defines the first preview registration contract,
+- and an in-repo sample SwiftUI host app scaffolded under `examples/sample-swiftui-app`.
 
 ## First Build Steps
 

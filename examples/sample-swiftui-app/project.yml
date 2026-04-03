@@ -1,0 +1,24 @@
+name: SampleSwiftUIApp
+options:
+  bundleIdPrefix: com.swiftuiexplorer.example
+packages:
+  SwiftPreviewKit:
+    path: ../../packages/swift-preview-kit
+settings:
+  base:
+    SWIFT_VERSION: 6.0
+targets:
+  SampleSwiftUIApp:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: SampleSwiftUIApp
+    dependencies:
+      - package: SwiftPreviewKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.swiftuiexplorer.example.SampleSwiftUIApp
+        INFOPLIST_KEY_CFBundleDisplayName: SwiftUI Explorer Sample
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES

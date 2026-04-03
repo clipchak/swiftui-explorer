@@ -7,21 +7,23 @@ The host app should eventually expose two things:
 
 ## Current Contract
 
-`SwiftPreviewKit` currently defines metadata types:
+`SwiftPreviewKit` currently defines:
 
+- `PreviewTarget`
 - `PreviewDescriptor`
 - `PreviewFixture`
 - `PreviewEnvironment`
+- `PreviewContext`
 - `PreviewRegistry`
 - `StaticPreviewRegistry`
 
-This is enough to start standardizing discovery before we wire in actual SwiftUI rendering closures.
+This is enough to standardize both discovery metadata and a host-side rendering closure for each registered preview target.
 
 ## Next Contract Expansion
 
 The next iteration should add:
 
-- a renderable target type that maps a descriptor to a SwiftUI view,
 - fixture payload hooks for mock state injection,
 - environment application helpers,
-- and a debug host app adapter that can select a target by identifier.
+- a debug host app adapter that can select a target by identifier,
+- and a serialization layer so the runtime can request targets and fixtures over a stable API.
