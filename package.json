@@ -1,0 +1,17 @@
+{
+  "name": "swiftui-explorer",
+  "private": true,
+  "version": "0.1.0",
+  "description": "SwiftUI preview and concept exploration tooling for Cursor and VS Code.",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "check": "npm run check --workspaces",
+    "clean": "rm -rf packages/*/dist"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

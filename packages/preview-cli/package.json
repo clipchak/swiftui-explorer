@@ -1,0 +1,19 @@
+{
+  "name": "@swiftui-explorer/preview-cli",
+  "version": "0.1.0",
+  "description": "Local runtime for SwiftUI Explorer preview orchestration.",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "swiftui-explorer-preview": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/index.js"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "typescript": "^5.9.2"
+  }
+}

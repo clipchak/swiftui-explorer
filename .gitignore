@@ -1,0 +1,9 @@
+node_modules
+dist
+.DS_Store
+.swiftpm
+.build
+DerivedData
+*.xcworkspace/xcuserdata
+*.xcodeproj/xcuserdata
+packages/vscode-extension/.vscode-test

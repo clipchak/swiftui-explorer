@@ -1,0 +1,50 @@
+{
+  "name": "@swiftui-explorer/vscode-extension",
+  "displayName": "SwiftUI Explorer",
+  "version": "0.1.0",
+  "description": "Preview and inspect SwiftUI targets from Cursor or VS Code.",
+  "publisher": "swiftui-explorer",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:swiftuiExplorer.openPanel",
+    "onCommand:swiftuiExplorer.checkRuntime"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "swiftuiExplorer.openPanel",
+        "title": "SwiftUI Explorer: Open Panel"
+      },
+      {
+        "command": "swiftuiExplorer.checkRuntime",
+        "title": "SwiftUI Explorer: Check Runtime"
+      }
+    ],
+    "configuration": {
+      "title": "SwiftUI Explorer",
+      "properties": {
+        "swiftuiExplorer.runtimeBaseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:4123",
+          "description": "Base URL for the local SwiftUI Explorer runtime."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "@types/vscode": "^1.96.0",
+    "typescript": "^5.9.2"
+  }
+}
