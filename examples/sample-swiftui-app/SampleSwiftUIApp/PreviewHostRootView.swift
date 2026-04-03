@@ -8,7 +8,7 @@ struct PreviewHostRootView: View {
     @State private var selectedFixtureID: String
     @State private var selectedEnvironmentID: String
 
-    init(registry: some PreviewRegistry) {
+    init(registry: some SwiftPreviewKit.PreviewRegistry) {
         let previews = registry.allPreviews()
         self.previews = previews
 

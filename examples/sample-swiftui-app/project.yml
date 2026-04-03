@@ -18,6 +18,7 @@ targets:
       - package: SwiftPreviewKit
     settings:
       base:
+        GENERATE_INFOPLIST_FILE: YES
         PRODUCT_BUNDLE_IDENTIFIER: com.swiftuiexplorer.example.SampleSwiftUIApp
         INFOPLIST_KEY_CFBundleDisplayName: SwiftUI Explorer Sample
         INFOPLIST_KEY_UILaunchScreen_Generation: YES

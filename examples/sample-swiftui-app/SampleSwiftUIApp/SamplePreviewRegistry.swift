@@ -1,7 +1,7 @@
 import SwiftUI
 import SwiftPreviewKit
 
-struct SamplePreviewRegistry: PreviewRegistry {
+struct SamplePreviewRegistry: SwiftPreviewKit.PreviewRegistry {
     func allPreviews() -> [PreviewTarget] {
         [
             PreviewTarget(
