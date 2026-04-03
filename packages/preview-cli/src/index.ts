@@ -1,5 +1,5 @@
 import * as http from "node:http";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import * as path from "node:path";
 
 type HealthResponse = {
@@ -16,6 +16,41 @@ type WorkspaceInspection = {
   hasWorkspace: boolean;
   hasXcodeGenSpec: boolean;
   suggestedNextAction: string;
+};
+
+type PreviewFixture = {
+  id: string;
+  displayName: string;
+};
+
+type PreviewEnvironment = {
+  id: string;
+  displayName: string;
+  colorScheme: "light" | "dark";
+  localeIdentifier: string;
+  dynamicTypeSize: string;
+};
+
+type PreviewDescriptor = {
+  id: string;
+  displayName: string;
+  fixtures: PreviewFixture[];
+  supportedEnvironments: PreviewEnvironment[];
+};
+
+type PreviewManifest = {
+  appName: string;
+  scheme: string;
+  targets: PreviewDescriptor[];
+};
+
+type PreviewTargetDiscovery = {
+  version: string;
+  appName: string | null;
+  scheme: string | null;
+  projectPath: string | null;
+  manifestPath: string | null;
+  targets: PreviewDescriptor[];
 };
 
 const VERSION = "0.1.0";
@@ -42,6 +77,11 @@ const server = http.createServer((request, response) => {
     return;
   }
 
+  if (request.method === "GET" && requestUrl.pathname === "/api/v1/targets") {
+    writeJson<PreviewTargetDiscovery>(response, 200, discoverPreviewTargets(workspaceRoot));
+    return;
+  }
+
   writeJson(response, 404, {
     version: VERSION,
     error: "Not found",
@@ -53,10 +93,13 @@ server.listen(port, "127.0.0.1", () => {
 });
 
 function inspectWorkspace(root: string): WorkspaceInspection {
-  const hasPackageSwift = fileExists(root, "Package.swift");
+  const hasPackageSwift = hasPathSuffix(root, "Package.swift");
+  const sampleApp = getSampleAppPaths(root);
   const hasXcodeProject = hasPathSuffix(root, ".xcodeproj");
   const hasWorkspace = hasPathSuffix(root, ".xcworkspace");
-  const hasXcodeGenSpec = fileExists(path.join(root, "examples", "sample-swiftui-app"), "project.yml");
+  const hasXcodeGenSpec = existsSync(sampleApp.specPath);
+  const hasPreviewManifest = existsSync(sampleApp.manifestPath);
+  const hasGeneratedSampleProject = existsSync(sampleApp.projectPath);
 
   return {
     version: VERSION,
@@ -70,6 +113,8 @@ function inspectWorkspace(root: string): WorkspaceInspection {
       hasXcodeProject,
       hasWorkspace,
       hasXcodeGenSpec,
+      hasPreviewManifest,
+      hasGeneratedSampleProject,
     }),
   };
 }
@@ -79,8 +124,10 @@ function suggestNextAction(input: {
   hasXcodeProject: boolean;
   hasWorkspace: boolean;
   hasXcodeGenSpec: boolean;
+  hasPreviewManifest: boolean;
+  hasGeneratedSampleProject: boolean;
 }): string {
-  if (input.hasXcodeGenSpec && !input.hasXcodeProject && !input.hasWorkspace) {
+  if (input.hasXcodeGenSpec && !input.hasGeneratedSampleProject) {
     return "Generate the sample app project with XcodeGen, then point the runtime at that app target.";
   }
 
@@ -92,7 +139,11 @@ function suggestNextAction(input: {
     return "Add SwiftPreviewKit to the host app and start defining preview targets.";
   }
 
-  return "Next, implement preview target discovery and simulator session startup.";
+  if (input.hasPreviewManifest) {
+    return "Preview targets are available. Next, wire selection into simulator launch and refresh.";
+  }
+
+  return "Add a preview manifest so the runtime can discover targets and fixtures.";
 }
 
 function fileExists(root: string, filename: string): boolean {
@@ -101,6 +152,48 @@ function fileExists(root: string, filename: string): boolean {
 
 function hasPathSuffix(root: string, suffix: string, depth = 3): boolean {
   return walk(root, depth).some((entry) => entry.endsWith(suffix));
+}
+
+function discoverPreviewTargets(root: string): PreviewTargetDiscovery {
+  const sampleApp = getSampleAppPaths(root);
+  const manifest = readPreviewManifest(sampleApp.manifestPath);
+
+  return {
+    version: VERSION,
+    appName: manifest?.appName ?? null,
+    scheme: manifest?.scheme ?? null,
+    projectPath: existsSync(sampleApp.projectPath) ? sampleApp.projectPath : null,
+    manifestPath: existsSync(sampleApp.manifestPath) ? sampleApp.manifestPath : null,
+    targets: manifest?.targets ?? [],
+  };
+}
+
+function getSampleAppPaths(root: string): {
+  sampleRoot: string;
+  specPath: string;
+  projectPath: string;
+  manifestPath: string;
+} {
+  const sampleRoot = path.join(root, "examples", "sample-swiftui-app");
+
+  return {
+    sampleRoot,
+    specPath: path.join(sampleRoot, "project.yml"),
+    projectPath: path.join(sampleRoot, "SampleSwiftUIApp.xcodeproj"),
+    manifestPath: path.join(sampleRoot, "SampleSwiftUIApp", "Resources", "PreviewManifest.json"),
+  };
+}
+
+function readPreviewManifest(manifestPath: string): PreviewManifest | null {
+  if (!existsSync(manifestPath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(readFileSync(manifestPath, "utf8")) as PreviewManifest;
+  } catch {
+    return null;
+  }
 }
 
 function walk(root: string, depth: number): string[] {

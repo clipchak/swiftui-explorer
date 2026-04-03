@@ -18,6 +18,35 @@ type WorkspaceInspection = {
   suggestedNextAction: string;
 };
 
+type PreviewFixture = {
+  id: string;
+  displayName: string;
+};
+
+type PreviewEnvironment = {
+  id: string;
+  displayName: string;
+  colorScheme: "light" | "dark";
+  localeIdentifier: string;
+  dynamicTypeSize: string;
+};
+
+type PreviewDescriptor = {
+  id: string;
+  displayName: string;
+  fixtures: PreviewFixture[];
+  supportedEnvironments: PreviewEnvironment[];
+};
+
+type PreviewTargetDiscovery = {
+  version: string;
+  appName: string | null;
+  scheme: string | null;
+  projectPath: string | null;
+  manifestPath: string | null;
+  targets: PreviewDescriptor[];
+};
+
 export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand("swiftuiExplorer.checkRuntime", async () => {
@@ -48,12 +77,13 @@ export function activate(context: vscode.ExtensionContext): void {
       const baseUrl = getRuntimeBaseUrl();
 
       try {
-        const [health, inspection] = await Promise.all([
+        const [health, inspection, discovery] = await Promise.all([
           getJson<RuntimeHealth>(`${baseUrl}/health`),
           getJson<WorkspaceInspection>(`${baseUrl}/api/v1/workspace/inspect`),
+          getJson<PreviewTargetDiscovery>(`${baseUrl}/api/v1/targets`),
         ]);
 
-        panel.webview.html = renderPanelHtml(health, inspection);
+        panel.webview.html = renderPanelHtml(health, inspection, discovery);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown runtime error";
         panel.webview.html = renderErrorHtml(baseUrl, message);
@@ -123,7 +153,11 @@ function renderErrorHtml(baseUrl: string, message: string): string {
   `);
 }
 
-function renderPanelHtml(health: RuntimeHealth, inspection: WorkspaceInspection): string {
+function renderPanelHtml(
+  health: RuntimeHealth,
+  inspection: WorkspaceInspection,
+  discovery: PreviewTargetDiscovery,
+): string {
   const checkItems: Array<[string, boolean]> = [
     ["Package.swift found", inspection.hasPackageSwift],
     ["Xcode project found", inspection.hasXcodeProject],
@@ -135,6 +169,17 @@ function renderPanelHtml(health: RuntimeHealth, inspection: WorkspaceInspection)
     .map(([label, ok]) => `<li>${escapeHtml(label)}: <strong>${ok ? "yes" : "no"}</strong></li>`)
     .join("");
 
+  const targetSummary = discovery.targets.length > 0
+    ? `
+      <p>Discovered <strong>${discovery.targets.length}</strong> preview target${discovery.targets.length === 1 ? "" : "s"} from <code>${escapeHtml(discovery.appName ?? "unknown app")}</code>.</p>
+      <p>Scheme: <code>${escapeHtml(discovery.scheme ?? "unknown")}</code></p>
+      <p>Manifest: <code>${escapeHtml(discovery.manifestPath ?? "not found")}</code></p>
+      ${renderTargetsList(discovery.targets)}
+    `
+    : `
+      <p>No preview targets are available yet.</p>
+    `;
+
   return renderShell(`
     <h1>SwiftUI Explorer</h1>
     <p>Runtime status: <strong>${escapeHtml(health.status)}</strong></p>
@@ -142,9 +187,33 @@ function renderPanelHtml(health: RuntimeHealth, inspection: WorkspaceInspection)
     <p>Workspace root: <code>${escapeHtml(inspection.workspaceRoot)}</code></p>
     <h2>Workspace inspection</h2>
     <ul>${checks}</ul>
+    <h2>Preview targets</h2>
+    ${targetSummary}
     <h2>Next step</h2>
     <p>${escapeHtml(inspection.suggestedNextAction)}</p>
   `);
+}
+
+function renderTargetsList(targets: PreviewDescriptor[]): string {
+  const items = targets
+    .map((target) => {
+      const fixtures = target.fixtures.length === 0
+        ? "No fixtures"
+        : target.fixtures.map((fixture) => fixture.displayName).join(", ");
+      const environments = target.supportedEnvironments.map((environment) => environment.displayName).join(", ");
+
+      return `
+        <li>
+          <strong>${escapeHtml(target.displayName)}</strong>
+          <div><code>${escapeHtml(target.id)}</code></div>
+          <div>Fixtures: ${escapeHtml(fixtures)}</div>
+          <div>Environments: ${escapeHtml(environments)}</div>
+        </li>
+      `;
+    })
+    .join("");
+
+  return `<ul>${items}</ul>`;
 }
 
 function renderShell(content: string): string {
@@ -167,6 +236,10 @@ function renderShell(content: string): string {
 
       h1, h2 {
         font-weight: 600;
+      }
+
+      li {
+        margin-bottom: 10px;
       }
     </style>
   </head>

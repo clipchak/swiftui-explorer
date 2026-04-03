@@ -2,38 +2,32 @@ import SwiftUI
 import SwiftPreviewKit
 
 struct SamplePreviewRegistry: SwiftPreviewKit.PreviewRegistry {
+    private let manifest = SamplePreviewManifest.load()
+
     func allPreviews() -> [PreviewTarget] {
-        [
-            PreviewTarget(
-                id: "welcome-card",
-                displayName: "Welcome Card",
-                fixtures: [
-                    PreviewFixture(id: "onboarding", displayName: "Onboarding"),
-                    PreviewFixture(id: "team-space", displayName: "Team Space")
-                ],
-                supportedEnvironments: [
-                    .defaultLight,
-                    .defaultDark,
-                    PreviewEnvironment(
-                        id: "accessibility-dark",
-                        displayName: "Dark + A11y",
-                        colorScheme: .dark,
-                        dynamicTypeSize: .accessibility1
-                    )
-                ]
-            ) { context in
+        manifest.targets.map { descriptor in
+            makePreviewTarget(from: descriptor)
+        }
+    }
+
+    private func makePreviewTarget(from descriptor: PreviewDescriptor) -> PreviewTarget {
+        switch descriptor.id {
+        case "welcome-card":
+            return PreviewTarget(descriptor: descriptor) { context in
                 WelcomeCardView(model: WelcomeCardModel.fixture(named: context.fixture?.id))
-            },
-            PreviewTarget(
-                id: "account-summary",
-                displayName: "Account Summary",
-                fixtures: [
-                    PreviewFixture(id: "healthy-budget", displayName: "Healthy Budget"),
-                    PreviewFixture(id: "tight-budget", displayName: "Tight Budget")
-                ]
-            ) { context in
+            }
+        case "account-summary":
+            return PreviewTarget(descriptor: descriptor) { context in
                 AccountSummaryView(model: AccountSummaryModel.fixture(named: context.fixture?.id))
             }
-        ]
+        default:
+            return PreviewTarget(descriptor: descriptor) { _ in
+                ContentUnavailableView(
+                    "Unknown Preview Target",
+                    systemImage: "questionmark.square.dashed",
+                    description: Text("No renderer is registered for \(descriptor.id).")
+                )
+            }
+        }
     }
 }

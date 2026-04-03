@@ -1,7 +1,7 @@
 import Foundation
 import SwiftUI
 
-public struct PreviewFixture: Hashable, Sendable, Identifiable {
+public struct PreviewFixture: Codable, Hashable, Sendable, Identifiable {
     public let id: String
     public let displayName: String
 
@@ -11,13 +11,13 @@ public struct PreviewFixture: Hashable, Sendable, Identifiable {
     }
 }
 
-public struct PreviewEnvironment: Hashable, Sendable, Identifiable {
-    public enum ColorScheme: String, Hashable, Sendable {
+public struct PreviewEnvironment: Codable, Hashable, Sendable, Identifiable {
+    public enum ColorScheme: String, Codable, Hashable, Sendable {
         case light
         case dark
     }
 
-    public enum DynamicTypeSizeOption: String, Hashable, Sendable {
+    public enum DynamicTypeSizeOption: String, Codable, Hashable, Sendable {
         case small
         case large
         case accessibility1
@@ -86,7 +86,7 @@ public struct PreviewEnvironment: Hashable, Sendable, Identifiable {
     }
 }
 
-public struct PreviewDescriptor: Hashable, Sendable {
+public struct PreviewDescriptor: Codable, Hashable, Sendable {
     public let id: String
     public let displayName: String
     public let fixtures: [PreviewFixture]
@@ -102,6 +102,18 @@ public struct PreviewDescriptor: Hashable, Sendable {
         self.displayName = displayName
         self.fixtures = fixtures
         self.supportedEnvironments = supportedEnvironments
+    }
+}
+
+public struct PreviewManifest: Codable, Hashable, Sendable {
+    public let appName: String
+    public let scheme: String
+    public let targets: [PreviewDescriptor]
+
+    public init(appName: String, scheme: String, targets: [PreviewDescriptor]) {
+        self.appName = appName
+        self.scheme = scheme
+        self.targets = targets
     }
 }
 
@@ -141,6 +153,16 @@ public struct PreviewTarget: Identifiable {
         }
     }
 
+    public init<Content: View>(
+        descriptor: PreviewDescriptor,
+        @ViewBuilder render: @escaping @MainActor (PreviewContext) -> Content
+    ) {
+        self.descriptor = descriptor
+        self.renderBody = { context in
+            AnyView(render(context))
+        }
+    }
+
     @MainActor
     public func makeView(
         fixtureID: String? = nil,
@@ -161,6 +183,14 @@ public protocol PreviewRegistry {
 public extension PreviewRegistry {
     func descriptors() -> [PreviewDescriptor] {
         allPreviews().map(\.descriptor)
+    }
+
+    func manifest(appName: String, scheme: String) -> PreviewManifest {
+        PreviewManifest(
+            appName: appName,
+            scheme: scheme,
+            targets: descriptors()
+        )
     }
 
     func preview(withID id: String) -> PreviewTarget? {

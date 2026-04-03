@@ -14,6 +14,8 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - path: SampleSwiftUIApp
+    resources:
+      - path: SampleSwiftUIApp/Resources
     dependencies:
       - package: SwiftPreviewKit
     settings:

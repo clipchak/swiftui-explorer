@@ -7,3 +7,4 @@ DerivedData
 *.xcworkspace/xcuserdata
 *.xcodeproj/xcuserdata
 packages/vscode-extension/.vscode-test
+examples/sample-swiftui-app/*.xcodeproj

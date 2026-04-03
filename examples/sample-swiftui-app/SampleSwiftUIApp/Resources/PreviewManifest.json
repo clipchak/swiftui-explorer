@@ -1,0 +1,73 @@
+{
+  "appName": "SampleSwiftUIApp",
+  "scheme": "SampleSwiftUIApp",
+  "targets": [
+    {
+      "id": "welcome-card",
+      "displayName": "Welcome Card",
+      "fixtures": [
+        {
+          "id": "onboarding",
+          "displayName": "Onboarding"
+        },
+        {
+          "id": "team-space",
+          "displayName": "Team Space"
+        }
+      ],
+      "supportedEnvironments": [
+        {
+          "id": "light",
+          "displayName": "Light",
+          "colorScheme": "light",
+          "localeIdentifier": "en_US",
+          "dynamicTypeSize": "large"
+        },
+        {
+          "id": "dark",
+          "displayName": "Dark",
+          "colorScheme": "dark",
+          "localeIdentifier": "en_US",
+          "dynamicTypeSize": "large"
+        },
+        {
+          "id": "accessibility-dark",
+          "displayName": "Dark + A11y",
+          "colorScheme": "dark",
+          "localeIdentifier": "en_US",
+          "dynamicTypeSize": "accessibility1"
+        }
+      ]
+    },
+    {
+      "id": "account-summary",
+      "displayName": "Account Summary",
+      "fixtures": [
+        {
+          "id": "healthy-budget",
+          "displayName": "Healthy Budget"
+        },
+        {
+          "id": "tight-budget",
+          "displayName": "Tight Budget"
+        }
+      ],
+      "supportedEnvironments": [
+        {
+          "id": "light",
+          "displayName": "Light",
+          "colorScheme": "light",
+          "localeIdentifier": "en_US",
+          "dynamicTypeSize": "large"
+        },
+        {
+          "id": "dark",
+          "displayName": "Dark",
+          "colorScheme": "dark",
+          "localeIdentifier": "en_US",
+          "dynamicTypeSize": "large"
+        }
+      ]
+    }
+  ]
+}
