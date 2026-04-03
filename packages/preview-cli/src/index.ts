@@ -80,8 +80,53 @@ type AutoRefreshState = {
   enabled: boolean;
 };
 
+type HostAppConfiguration = {
+  version: string;
+  usingDefault: boolean;
+  appRoot: string;
+  projectPath: string | null;
+  workspacePath: string | null;
+  xcodeGenSpecPath: string | null;
+  scheme: string;
+  manifestPath: string;
+  bundleIdentifier: string;
+};
+
+type HostAppConfigurationInput = {
+  appRoot?: unknown;
+  projectPath?: unknown;
+  workspacePath?: unknown;
+  xcodeGenSpecPath?: unknown;
+  scheme?: unknown;
+  manifestPath?: unknown;
+  bundleIdentifier?: unknown;
+};
+
+type PersistedHostAppConfiguration = {
+  appRoot: string;
+  projectPath?: string;
+  workspacePath?: string;
+  xcodeGenSpecPath?: string;
+  scheme: string;
+  manifestPath: string;
+  bundleIdentifier: string;
+};
+
 type RuntimeState = {
   autoRefreshEnabled: boolean;
+  hostAppConfiguration?: PersistedHostAppConfiguration;
+};
+
+type ResolvedHostAppConfiguration = {
+  usingDefault: boolean;
+  appRoot: string;
+  projectPath: string | null;
+  workspacePath: string | null;
+  xcodeGenSpecPath: string | null;
+  scheme: string;
+  manifestPath: string;
+  bundleIdentifier: string;
+  derivedDataPath: string;
 };
 
 type SimulatorDevice = {
@@ -111,7 +156,6 @@ class HttpError extends Error {
 const VERSION = "0.1.0";
 const SERVICE = "swiftui-explorer-preview-cli";
 const DEFAULT_PORT = 4123;
-const SAMPLE_APP_BUNDLE_IDENTIFIER = "com.swiftuiexplorer.example.SampleSwiftUIApp";
 const execFileAsync = promisify(execFile);
 const AUTO_REFRESH_DELAY_MS = 600;
 
@@ -159,6 +203,26 @@ async function handleRequest(request: http.IncomingMessage, response: http.Serve
 
   if (request.method === "GET" && requestUrl.pathname === "/api/v1/targets") {
     writeJson<PreviewTargetDiscovery>(response, 200, discoverPreviewTargets(workspaceRoot));
+    return;
+  }
+
+  if (request.method === "GET" && requestUrl.pathname === "/api/v1/config") {
+    writeJson<HostAppConfiguration>(response, 200, getHostAppConfigurationResponse(workspaceRoot));
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/v1/config") {
+    const body = await readJsonBody<HostAppConfigurationInput>(request);
+    const nextConfiguration = validateHostAppConfigurationInput(body);
+    runtimeState = {
+      ...runtimeState,
+      hostAppConfiguration: persistHostAppConfiguration(workspaceRoot, nextConfiguration),
+    };
+    saveRuntimeState(workspaceRoot, runtimeState);
+    closePreviewWatchers();
+    ensurePreviewWatchers(workspaceRoot);
+
+    writeJson<HostAppConfiguration>(response, 200, getHostAppConfigurationResponse(workspaceRoot));
     return;
   }
 
@@ -211,13 +275,15 @@ async function handleRequest(request: http.IncomingMessage, response: http.Serve
 }
 
 function inspectWorkspace(root: string): WorkspaceInspection {
+  const hostApp = resolveHostAppConfiguration(root);
   const hasPackageSwift = hasPathSuffix(root, "Package.swift");
-  const sampleApp = getSampleAppPaths(root);
   const hasXcodeProject = hasPathSuffix(root, ".xcodeproj");
   const hasWorkspace = hasPathSuffix(root, ".xcworkspace");
-  const hasXcodeGenSpec = existsSync(sampleApp.specPath);
-  const hasPreviewManifest = existsSync(sampleApp.manifestPath);
-  const hasGeneratedSampleProject = existsSync(sampleApp.projectPath);
+  const hasXcodeGenSpec = hostApp.xcodeGenSpecPath
+    ? existsSync(hostApp.xcodeGenSpecPath)
+    : hasPathSuffix(root, "project.yml") || hasPathSuffix(root, "project.yaml");
+  const hasPreviewManifest = existsSync(hostApp.manifestPath);
+  const hasGeneratedHostProject = hostApp.projectPath ? existsSync(hostApp.projectPath) : hostApp.workspacePath ? existsSync(hostApp.workspacePath) : false;
 
   return {
     version: VERSION,
@@ -232,7 +298,8 @@ function inspectWorkspace(root: string): WorkspaceInspection {
       hasWorkspace,
       hasXcodeGenSpec,
       hasPreviewManifest,
-      hasGeneratedSampleProject,
+      hasGeneratedHostProject,
+      usingDefaultHostAppConfiguration: hostApp.usingDefault,
     }),
   };
 }
@@ -243,14 +310,19 @@ function suggestNextAction(input: {
   hasWorkspace: boolean;
   hasXcodeGenSpec: boolean;
   hasPreviewManifest: boolean;
-  hasGeneratedSampleProject: boolean;
+  hasGeneratedHostProject: boolean;
+  usingDefaultHostAppConfiguration: boolean;
 }): string {
-  if (input.hasXcodeGenSpec && !input.hasGeneratedSampleProject) {
-    return "Generate the sample app project with XcodeGen, then point the runtime at that app target.";
+  if (input.usingDefaultHostAppConfiguration) {
+    return "Using the sample app configuration. Configure a host app workspace to preview your real app.";
+  }
+
+  if (input.hasXcodeGenSpec && !input.hasGeneratedHostProject) {
+    return "Generate the configured host app project with XcodeGen, then reopen the explorer.";
   }
 
   if (!input.hasXcodeProject && !input.hasWorkspace) {
-    return "Add a sample SwiftUI host app or point the runtime at an existing app workspace.";
+    return "Configure a SwiftUI host app project or workspace so the runtime can build previews.";
   }
 
   if (!input.hasPackageSwift) {
@@ -258,10 +330,10 @@ function suggestNextAction(input: {
   }
 
   if (input.hasPreviewManifest) {
-    return "Preview launch is available. Use Open Preview In Simulator, then Refresh Preview to relaunch the last selection.";
+    return "Preview launch is available. Open a preview in Simulator or reconfigure the host app if you want a different target.";
   }
 
-  return "Add a preview manifest so the runtime can discover targets and fixtures.";
+  return "Configure a valid preview manifest so the runtime can discover targets and fixtures.";
 }
 
 function fileExists(root: string, filename: string): boolean {
@@ -273,15 +345,19 @@ function hasPathSuffix(root: string, suffix: string, depth = 3): boolean {
 }
 
 function discoverPreviewTargets(root: string): PreviewTargetDiscovery {
-  const sampleApp = getSampleAppPaths(root);
-  const manifest = readPreviewManifest(sampleApp.manifestPath);
+  const hostApp = resolveHostAppConfiguration(root);
+  const manifest = readPreviewManifest(hostApp.manifestPath);
 
   return {
     version: VERSION,
-    appName: manifest?.appName ?? null,
-    scheme: manifest?.scheme ?? null,
-    projectPath: existsSync(sampleApp.projectPath) ? sampleApp.projectPath : null,
-    manifestPath: existsSync(sampleApp.manifestPath) ? sampleApp.manifestPath : null,
+    appName: manifest?.appName ?? path.basename(hostApp.appRoot),
+    scheme: hostApp.scheme,
+    projectPath: hostApp.projectPath && existsSync(hostApp.projectPath)
+      ? hostApp.projectPath
+      : hostApp.workspacePath && existsSync(hostApp.workspacePath)
+      ? hostApp.workspacePath
+      : null,
+    manifestPath: existsSync(hostApp.manifestPath) ? hostApp.manifestPath : null,
     targets: manifest?.targets ?? [],
   };
 }
@@ -290,6 +366,22 @@ function getAutoRefreshStateResponse(): AutoRefreshState {
   return {
     version: VERSION,
     enabled: runtimeState.autoRefreshEnabled,
+  };
+}
+
+function getHostAppConfigurationResponse(root: string): HostAppConfiguration {
+  const hostApp = resolveHostAppConfiguration(root);
+
+  return {
+    version: VERSION,
+    usingDefault: hostApp.usingDefault,
+    appRoot: hostApp.appRoot,
+    projectPath: hostApp.projectPath,
+    workspacePath: hostApp.workspacePath,
+    xcodeGenSpecPath: hostApp.xcodeGenSpecPath,
+    scheme: hostApp.scheme,
+    manifestPath: hostApp.manifestPath,
+    bundleIdentifier: hostApp.bundleIdentifier,
   };
 }
 
@@ -302,10 +394,10 @@ async function openPreview(
     throw new HttpError(400, "targetId is required.");
   }
 
-  const sampleApp = getSampleAppPaths(root);
-  await ensureSampleProject(sampleApp, root);
+  const hostApp = resolveHostAppConfiguration(root);
+  await ensureHostAppProject(hostApp, root);
 
-  const manifest = readPreviewManifest(sampleApp.manifestPath);
+  const manifest = readPreviewManifest(hostApp.manifestPath);
   if (!manifest) {
     throw new HttpError(400, "Preview manifest is missing or invalid.");
   }
@@ -321,8 +413,8 @@ async function openPreview(
 
   await ensureSimulatorBooted(simulator.udid);
   await focusSimulatorApp(simulator.udid);
-  const appPath = await buildSampleApp(sampleApp, root, manifest.scheme, simulator.udid);
-  await installAndLaunchSampleApp(appPath, simulator.udid, {
+  const appPath = await buildHostApp(hostApp, root, hostApp.scheme, simulator.udid, manifest.appName);
+  await installAndLaunchHostApp(hostApp.bundleIdentifier, appPath, simulator.udid, {
     targetId: target.id,
     fixtureId: fixture?.id ?? null,
     environmentId: environment?.id ?? null,
@@ -341,34 +433,29 @@ async function openPreview(
     version: VERSION,
     status,
     appName: manifest.appName,
-    scheme: manifest.scheme,
+    scheme: hostApp.scheme,
     simulatorId: simulator.udid,
     simulatorName: simulator.name,
-    bundleIdentifier: SAMPLE_APP_BUNDLE_IDENTIFIER,
+    bundleIdentifier: hostApp.bundleIdentifier,
     targetId: target.id,
     fixtureId: fixture?.id ?? null,
     environmentId: environment?.id ?? null,
   };
 }
 
-function getSampleAppPaths(root: string): {
-  sampleRoot: string;
-  specPath: string;
-  projectPath: string;
-  manifestPath: string;
-  derivedDataPath: string;
-  appPath: string;
-} {
-  const sampleRoot = path.join(root, "examples", "sample-swiftui-app");
-  const derivedDataPath = path.join(root, ".swiftui-explorer", "derived-data", "sample-swiftui-app");
+function getDefaultHostAppConfiguration(root: string): ResolvedHostAppConfiguration {
+  const appRoot = path.join(root, "examples", "sample-swiftui-app");
 
   return {
-    sampleRoot,
-    specPath: path.join(sampleRoot, "project.yml"),
-    projectPath: path.join(sampleRoot, "SampleSwiftUIApp.xcodeproj"),
-    manifestPath: path.join(sampleRoot, "SampleSwiftUIApp", "Resources", "PreviewManifest.json"),
-    derivedDataPath,
-    appPath: path.join(derivedDataPath, "Build", "Products", "Debug-iphonesimulator", "SampleSwiftUIApp.app"),
+    usingDefault: true,
+    appRoot,
+    projectPath: path.join(appRoot, "SampleSwiftUIApp.xcodeproj"),
+    workspacePath: null,
+    xcodeGenSpecPath: path.join(appRoot, "project.yml"),
+    scheme: "SampleSwiftUIApp",
+    manifestPath: path.join(appRoot, "SampleSwiftUIApp", "Resources", "PreviewManifest.json"),
+    bundleIdentifier: "com.swiftuiexplorer.example.SampleSwiftUIApp",
+    derivedDataPath: path.join(root, ".swiftui-explorer", "derived-data", "sample-swiftui-app"),
   };
 }
 
@@ -388,6 +475,7 @@ function loadRuntimeState(root: string): RuntimeState {
     const parsed = JSON.parse(readFileSync(statePath, "utf8")) as Partial<RuntimeState>;
     return {
       autoRefreshEnabled: parsed.autoRefreshEnabled ?? true,
+      hostAppConfiguration: parsed.hostAppConfiguration,
     };
   } catch {
     return {
@@ -402,6 +490,107 @@ function saveRuntimeState(root: string, state: RuntimeState): void {
     recursive: true,
   });
   writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+}
+
+function validateHostAppConfigurationInput(input: HostAppConfigurationInput): PersistedHostAppConfiguration {
+  if (typeof input.appRoot !== "string" || !input.appRoot.trim()) {
+    throw new HttpError(400, "appRoot is required.");
+  }
+
+  if (typeof input.scheme !== "string" || !input.scheme.trim()) {
+    throw new HttpError(400, "scheme is required.");
+  }
+
+  if (typeof input.manifestPath !== "string" || !input.manifestPath.trim()) {
+    throw new HttpError(400, "manifestPath is required.");
+  }
+
+  if (typeof input.bundleIdentifier !== "string" || !input.bundleIdentifier.trim()) {
+    throw new HttpError(400, "bundleIdentifier is required.");
+  }
+
+  const projectPath = typeof input.projectPath === "string" && input.projectPath.trim() ? input.projectPath : undefined;
+  const workspacePath = typeof input.workspacePath === "string" && input.workspacePath.trim() ? input.workspacePath : undefined;
+  if ((projectPath ? 1 : 0) + (workspacePath ? 1 : 0) !== 1) {
+    throw new HttpError(400, "Provide exactly one of projectPath or workspacePath.");
+  }
+
+  const xcodeGenSpecPath = typeof input.xcodeGenSpecPath === "string" && input.xcodeGenSpecPath.trim()
+    ? input.xcodeGenSpecPath
+    : undefined;
+
+  return {
+    appRoot: input.appRoot.trim(),
+    projectPath,
+    workspacePath,
+    xcodeGenSpecPath,
+    scheme: input.scheme.trim(),
+    manifestPath: input.manifestPath.trim(),
+    bundleIdentifier: input.bundleIdentifier.trim(),
+  };
+}
+
+function persistHostAppConfiguration(root: string, configuration: PersistedHostAppConfiguration): PersistedHostAppConfiguration {
+  return {
+    appRoot: toStoredPath(root, configuration.appRoot),
+    ...(configuration.projectPath ? { projectPath: toStoredPath(root, configuration.projectPath) } : {}),
+    ...(configuration.workspacePath ? { workspacePath: toStoredPath(root, configuration.workspacePath) } : {}),
+    ...(configuration.xcodeGenSpecPath ? { xcodeGenSpecPath: toStoredPath(root, configuration.xcodeGenSpecPath) } : {}),
+    scheme: configuration.scheme,
+    manifestPath: toStoredPath(root, configuration.manifestPath),
+    bundleIdentifier: configuration.bundleIdentifier,
+  };
+}
+
+function resolveHostAppConfiguration(root: string): ResolvedHostAppConfiguration {
+  const configured = runtimeState.hostAppConfiguration;
+  if (
+    !configured
+    || !configured.appRoot
+    || !configured.scheme
+    || !configured.manifestPath
+    || !configured.bundleIdentifier
+    || ((!configured.projectPath ? 0 : 1) + (!configured.workspacePath ? 0 : 1) !== 1)
+  ) {
+    return getDefaultHostAppConfiguration(root);
+  }
+
+  const appRoot = resolveWorkspacePath(root, configured.appRoot);
+  const projectPath = configured.projectPath ? resolveWorkspacePath(root, configured.projectPath) : null;
+  const workspacePath = configured.workspacePath ? resolveWorkspacePath(root, configured.workspacePath) : null;
+  const xcodeGenSpecPath = configured.xcodeGenSpecPath ? resolveWorkspacePath(root, configured.xcodeGenSpecPath) : null;
+  const derivedDataKey = slugify(`${path.basename(appRoot)}-${configured.scheme}`);
+
+  return {
+    usingDefault: false,
+    appRoot,
+    projectPath,
+    workspacePath,
+    xcodeGenSpecPath,
+    scheme: configured.scheme,
+    manifestPath: resolveWorkspacePath(root, configured.manifestPath),
+    bundleIdentifier: configured.bundleIdentifier,
+    derivedDataPath: path.join(root, ".swiftui-explorer", "derived-data", derivedDataKey),
+  };
+}
+
+function resolveWorkspacePath(root: string, candidatePath: string): string {
+  return path.isAbsolute(candidatePath) ? path.normalize(candidatePath) : path.join(root, candidatePath);
+}
+
+function toStoredPath(root: string, candidatePath: string): string {
+  const absolutePath = resolveWorkspacePath(root, candidatePath);
+  const relativePath = path.relative(root, absolutePath);
+
+  if (!relativePath.startsWith("..") && !path.isAbsolute(relativePath)) {
+    return relativePath || ".";
+  }
+
+  return absolutePath;
+}
+
+function slugify(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase() || "host-app";
 }
 
 function readPreviewManifest(manifestPath: string): PreviewManifest | null {
@@ -421,9 +610,9 @@ function ensurePreviewWatchers(root: string): void {
     return;
   }
 
-  const sampleApp = getSampleAppPaths(root);
+  const hostApp = resolveHostAppConfiguration(root);
   const watchRoots = [
-    sampleApp.sampleRoot,
+    hostApp.appRoot,
     path.join(root, "packages", "swift-preview-kit"),
   ].filter(existsSync);
 
@@ -448,6 +637,13 @@ function ensurePreviewWatchers(root: string): void {
 
     previewWatchers.push(watcher);
   }
+}
+
+function closePreviewWatchers(): void {
+  for (const watcher of previewWatchers) {
+    watcher.close();
+  }
+  previewWatchers = [];
 }
 
 function shouldAutoRefreshFromFile(relativePath: string): boolean {
@@ -506,19 +702,27 @@ async function triggerAutoRefresh(root: string): Promise<void> {
   }
 }
 
-async function ensureSampleProject(
-  sampleApp: ReturnType<typeof getSampleAppPaths>,
+async function ensureHostAppProject(
+  hostApp: ResolvedHostAppConfiguration,
   root: string,
 ): Promise<void> {
-  if (existsSync(sampleApp.projectPath)) {
+  if (hostApp.workspacePath && existsSync(hostApp.workspacePath)) {
     return;
   }
 
-  if (!existsSync(sampleApp.specPath)) {
-    throw new HttpError(400, "Sample app project spec was not found.");
+  if (hostApp.projectPath && existsSync(hostApp.projectPath)) {
+    return;
   }
 
-  await runCommand("xcodegen", ["generate", "--spec", sampleApp.specPath], root);
+  if (!hostApp.xcodeGenSpecPath || !hostApp.projectPath) {
+    throw new HttpError(400, "Configured host app project or workspace was not found.");
+  }
+
+  if (!existsSync(hostApp.xcodeGenSpecPath)) {
+    throw new HttpError(400, "Configured XcodeGen spec was not found.");
+  }
+
+  await runCommand("xcodegen", ["generate", "--spec", hostApp.xcodeGenSpecPath], root);
 }
 
 function resolveFixture(target: PreviewDescriptor, fixtureId?: string): PreviewFixture | null {
@@ -642,40 +846,51 @@ async function focusSimulatorApp(simulatorId: string): Promise<void> {
   );
 }
 
-async function buildSampleApp(
-  sampleApp: ReturnType<typeof getSampleAppPaths>,
+async function buildHostApp(
+  hostApp: ResolvedHostAppConfiguration,
   root: string,
   scheme: string,
   simulatorId: string,
+  appName: string,
 ): Promise<string> {
-  mkdirSync(sampleApp.derivedDataPath, {
+  mkdirSync(hostApp.derivedDataPath, {
     recursive: true,
   });
+
+  const buildTargetArgs = hostApp.workspacePath
+    ? ["-workspace", hostApp.workspacePath]
+    : hostApp.projectPath
+    ? ["-project", hostApp.projectPath]
+    : [];
+  if (buildTargetArgs.length === 0) {
+    throw new HttpError(400, "Configured host app project or workspace was not found.");
+  }
 
   await runCommand(
     "xcodebuild",
     [
-      "-project",
-      sampleApp.projectPath,
+      ...buildTargetArgs,
       "-scheme",
       scheme,
       "-destination",
       `id=${simulatorId}`,
       "-derivedDataPath",
-      sampleApp.derivedDataPath,
+      hostApp.derivedDataPath,
       "build",
     ],
     root,
   );
 
-  if (!existsSync(sampleApp.appPath)) {
-    throw new HttpError(500, `Built app not found at '${sampleApp.appPath}'.`);
+  const appPath = path.join(hostApp.derivedDataPath, "Build", "Products", "Debug-iphonesimulator", `${appName}.app`);
+  if (!existsSync(appPath)) {
+    throw new HttpError(500, `Built app not found at '${appPath}'.`);
   }
 
-  return sampleApp.appPath;
+  return appPath;
 }
 
-async function installAndLaunchSampleApp(
+async function installAndLaunchHostApp(
+  bundleIdentifier: string,
   appPath: string,
   simulatorId: string,
   selection: {
@@ -688,7 +903,7 @@ async function installAndLaunchSampleApp(
 
   await runCommand(
     "xcrun",
-    ["simctl", "launch", "--terminate-running-process", simulatorId, SAMPLE_APP_BUNDLE_IDENTIFIER],
+    ["simctl", "launch", "--terminate-running-process", simulatorId, bundleIdentifier],
     workspaceRoot,
     {
       env: {

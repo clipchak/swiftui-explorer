@@ -20,6 +20,8 @@ The repo is bootstrapped around the first MVP slice:
 - a Swift package that defines the first preview registration contract,
 - and an in-repo sample SwiftUI host app scaffolded under `examples/sample-swiftui-app`.
 
+The runtime now defaults to the sample app, but the explorer can also be pointed at a custom host app project or workspace through the `Configure Host App` command or panel button.
+
 ## First Build Steps
 
 ```bash

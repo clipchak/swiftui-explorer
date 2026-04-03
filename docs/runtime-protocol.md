@@ -38,13 +38,49 @@ Returns the runtime's view of the current workspace:
 }
 ```
 
+### `GET /api/v1/config`
+
+Returns the active host app configuration the runtime will use for discovery, build, install, and launch:
+
+```json
+{
+  "version": "0.1.0",
+  "usingDefault": true,
+  "appRoot": "/path/to/app",
+  "projectPath": "/path/to/App.xcodeproj",
+  "workspacePath": null,
+  "xcodeGenSpecPath": "/path/to/project.yml",
+  "scheme": "App",
+  "manifestPath": "/path/to/PreviewManifest.json",
+  "bundleIdentifier": "com.example.app"
+}
+```
+
+### `POST /api/v1/config`
+
+Persists a host app configuration. The request must include:
+
+- `appRoot`
+- exactly one of `projectPath` or `workspacePath`
+- `scheme`
+- `manifestPath`
+- `bundleIdentifier`
+- optional `xcodeGenSpecPath`
+
+### `GET /api/v1/auto-refresh`
+
+Returns whether runtime-owned auto-refresh is currently enabled.
+
+### `POST /api/v1/auto-refresh`
+
+Updates the persisted runtime-owned auto-refresh state.
+
 ## Expected Near-Term Additions
 
 - `POST /api/v1/session/start`
 - `POST /api/v1/preview/open`
 - `POST /api/v1/preview/refresh`
 - `GET /api/v1/targets`
-- `GET /api/v1/fixtures`
 - `POST /api/v1/capture/snapshot`
 
 ## Design Constraints

@@ -1,5 +1,7 @@
 import * as http from "node:http";
 import * as https from "node:https";
+import { existsSync } from "node:fs";
+import * as path from "node:path";
 import * as vscode from "vscode";
 
 type RuntimeHealth = {
@@ -71,6 +73,18 @@ type AutoRefreshState = {
   enabled: boolean;
 };
 
+type HostAppConfiguration = {
+  version: string;
+  usingDefault: boolean;
+  appRoot: string;
+  projectPath: string | null;
+  workspacePath: string | null;
+  xcodeGenSpecPath: string | null;
+  scheme: string;
+  manifestPath: string;
+  bundleIdentifier: string;
+};
+
 const LAST_PREVIEW_STATE_KEY = "swiftuiExplorer.lastPreviewSelection";
 
 type ExplorerSnapshot = {
@@ -78,6 +92,7 @@ type ExplorerSnapshot = {
   inspection: WorkspaceInspection;
   discovery: PreviewTargetDiscovery;
   autoRefresh: AutoRefreshState;
+  hostAppConfiguration: HostAppConfiguration;
   selection: OpenPreviewRequest | null;
 };
 
@@ -159,6 +174,23 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.window.showWarningMessage(`Could not refresh preview: ${message}`);
       }
     }),
+    vscode.commands.registerCommand("swiftuiExplorer.configureHostApp", async () => {
+      const baseUrl = getRuntimeBaseUrl();
+
+      try {
+        const configuredHostApp = await promptForHostAppConfiguration(baseUrl);
+        if (!configuredHostApp) {
+          return;
+        }
+
+        vscode.window.showInformationMessage(
+          `Configured ${path.basename(configuredHostApp.appRoot)} for SwiftUI Explorer.`,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown runtime error";
+        vscode.window.showWarningMessage(`Could not configure host app: ${message}`);
+      }
+    }),
     vscode.commands.registerCommand("swiftuiExplorer.openPanel", async () => {
       const panel = vscode.window.createWebviewPanel(
         "swiftuiExplorer",
@@ -174,7 +206,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const baseUrl = getRuntimeBaseUrl();
 
       try {
-        const snapshot = await loadExplorerSnapshot(context, baseUrl);
+        let snapshot = await loadExplorerSnapshot(context, baseUrl);
         panel.webview.html = renderPanelHtml(snapshot);
 
         panel.webview.onDidReceiveMessage(async (message: unknown) => {
@@ -202,6 +234,32 @@ export function activate(context: vscode.ExtensionContext): void {
                 type: "previewStatus",
                 kind: "error",
                 text: `Could not open preview: ${messageText}`,
+              });
+            }
+
+            return;
+          }
+
+          if (message.type === "configureHostApp") {
+            try {
+              const configuredHostApp = await promptForHostAppConfiguration(baseUrl);
+              if (!configuredHostApp) {
+                panel.webview.postMessage({
+                  type: "previewStatus",
+                  kind: "success",
+                  text: "Host app configuration canceled.",
+                });
+                return;
+              }
+
+              snapshot = await loadExplorerSnapshot(context, baseUrl);
+              panel.webview.html = renderPanelHtml(snapshot);
+            } catch (error) {
+              const messageText = error instanceof Error ? error.message : "Unknown runtime error";
+              panel.webview.postMessage({
+                type: "previewStatus",
+                kind: "error",
+                text: `Could not configure host app: ${messageText}`,
               });
             }
 
@@ -277,11 +335,12 @@ async function loadExplorerSnapshot(
   context: vscode.ExtensionContext,
   baseUrl: string,
 ): Promise<ExplorerSnapshot> {
-  const [health, inspection, discovery, autoRefresh] = await Promise.all([
+  const [health, inspection, discovery, autoRefresh, hostAppConfiguration] = await Promise.all([
     getJson<RuntimeHealth>(`${baseUrl}/health`),
     getJson<WorkspaceInspection>(`${baseUrl}/api/v1/workspace/inspect`),
     getJson<PreviewTargetDiscovery>(`${baseUrl}/api/v1/targets`),
     getJson<AutoRefreshState>(`${baseUrl}/api/v1/auto-refresh`),
+    getJson<HostAppConfiguration>(`${baseUrl}/api/v1/config`),
   ]);
 
   return {
@@ -289,11 +348,99 @@ async function loadExplorerSnapshot(
     inspection,
     discovery,
     autoRefresh,
+    hostAppConfiguration,
     selection: normalizeSelection(
       context.globalState.get<OpenPreviewRequest>(LAST_PREVIEW_STATE_KEY),
       discovery.targets,
     ),
   };
+}
+
+async function promptForHostAppConfiguration(baseUrl: string): Promise<HostAppConfiguration | undefined> {
+  const workspaceUri = vscode.workspace.workspaceFolders?.[0]?.uri;
+  const appRootUri = await pickSingleUri({
+    canSelectFiles: false,
+    canSelectFolders: true,
+    canSelectMany: false,
+    defaultUri: workspaceUri,
+    openLabel: "Select Host App Root",
+    title: "Select SwiftUI Host App Root",
+  });
+  if (!appRootUri) {
+    return undefined;
+  }
+
+  const buildContainerUri = await pickSingleUri({
+    canSelectFiles: true,
+    canSelectFolders: false,
+    canSelectMany: false,
+    defaultUri: appRootUri,
+    openLabel: "Select Project or Workspace",
+    title: "Select Xcode Project or Workspace",
+    filters: {
+      "Xcode Project or Workspace": ["xcodeproj", "xcworkspace"],
+    },
+  });
+  if (!buildContainerUri) {
+    return undefined;
+  }
+
+  const manifestUri = await pickSingleUri({
+    canSelectFiles: true,
+    canSelectFolders: false,
+    canSelectMany: false,
+    defaultUri: appRootUri,
+    openLabel: "Select Preview Manifest",
+    title: "Select Preview Manifest",
+    filters: {
+      JSON: ["json"],
+    },
+  });
+  if (!manifestUri) {
+    return undefined;
+  }
+
+  const scheme = await vscode.window.showInputBox({
+    title: "SwiftUI Explorer Scheme",
+    prompt: "Enter the Xcode scheme to build for previews.",
+    ignoreFocusOut: true,
+    validateInput: (value) => value.trim() ? undefined : "Scheme is required.",
+  });
+  if (!scheme) {
+    return undefined;
+  }
+
+  const bundleIdentifier = await vscode.window.showInputBox({
+    title: "SwiftUI Explorer Bundle Identifier",
+    prompt: "Enter the app bundle identifier used to launch the host app in Simulator.",
+    ignoreFocusOut: true,
+    validateInput: (value) => value.trim() ? undefined : "Bundle identifier is required.",
+  });
+  if (!bundleIdentifier) {
+    return undefined;
+  }
+
+  const detectedXcodeGenSpecPath = ["project.yml", "project.yaml"]
+    .map((name) => path.join(appRootUri.fsPath, name))
+    .find((candidate) => existsSync(candidate));
+
+  const input = {
+    appRoot: appRootUri.fsPath,
+    ...(buildContainerUri.fsPath.endsWith(".xcworkspace")
+      ? { workspacePath: buildContainerUri.fsPath }
+      : { projectPath: buildContainerUri.fsPath }),
+    ...(detectedXcodeGenSpecPath ? { xcodeGenSpecPath: detectedXcodeGenSpecPath } : {}),
+    scheme: scheme.trim(),
+    manifestPath: manifestUri.fsPath,
+    bundleIdentifier: bundleIdentifier.trim(),
+  };
+
+  return postJson<HostAppConfiguration>(`${baseUrl}/api/v1/config`, input);
+}
+
+async function pickSingleUri(options: vscode.OpenDialogOptions): Promise<vscode.Uri | undefined> {
+  const selection = await vscode.window.showOpenDialog(options);
+  return selection?.[0];
 }
 
 function getRuntimeBaseUrl(): string {
@@ -523,7 +670,7 @@ function renderErrorHtml(baseUrl: string, message: string): string {
 }
 
 function renderPanelHtml(snapshot: ExplorerSnapshot): string {
-  const { health, inspection, discovery, autoRefresh, selection } = snapshot;
+  const { health, inspection, discovery, autoRefresh, hostAppConfiguration, selection } = snapshot;
   const checkItems: Array<[string, boolean]> = [
     ["Package.swift found", inspection.hasPackageSwift],
     ["Xcode project found", inspection.hasXcodeProject],
@@ -534,6 +681,24 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
   const checks = checkItems
     .map(([label, ok]) => `<li>${escapeHtml(label)}: <strong>${ok ? "yes" : "no"}</strong></li>`)
     .join("");
+  const buildContainerLabel = hostAppConfiguration.workspacePath
+    ? `Workspace: <code>${escapeHtml(hostAppConfiguration.workspacePath)}</code>`
+    : `Project: <code>${escapeHtml(hostAppConfiguration.projectPath ?? "not configured")}</code>`;
+  const hostAppSummary = `
+    <div class="detailCard">
+      <div class="buttonRow configHeader">
+        <strong>Host App</strong>
+        <button id="configureButton" class="secondary">Configure Host App</button>
+      </div>
+      <p>Mode: <strong>${hostAppConfiguration.usingDefault ? "Sample app" : "Custom app"}</strong></p>
+      <p>Root: <code>${escapeHtml(hostAppConfiguration.appRoot)}</code></p>
+      <p>${buildContainerLabel}</p>
+      <p>Scheme: <code>${escapeHtml(hostAppConfiguration.scheme)}</code></p>
+      <p>Bundle ID: <code>${escapeHtml(hostAppConfiguration.bundleIdentifier)}</code></p>
+      <p>Manifest: <code>${escapeHtml(hostAppConfiguration.manifestPath)}</code></p>
+      <p>XcodeGen: <code>${escapeHtml(hostAppConfiguration.xcodeGenSpecPath ?? "not configured")}</code></p>
+    </div>
+  `;
 
   const bootstrapJson = escapeScriptJson(
     JSON.stringify({
@@ -587,6 +752,8 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
     <p>Runtime status: <strong>${escapeHtml(health.status)}</strong></p>
     <p>Runtime version: <code>${escapeHtml(health.version)}</code></p>
     <p>Workspace root: <code>${escapeHtml(inspection.workspaceRoot)}</code></p>
+    <h2>Host app</h2>
+    ${hostAppSummary}
     <h2>Workspace inspection</h2>
     <ul>${checks}</ul>
     <h2>Preview targets</h2>
@@ -608,6 +775,7 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
       const openButton = document.getElementById("openButton");
       const refreshButton = document.getElementById("refreshButton");
       const autoRefreshToggle = document.getElementById("autoRefreshToggle");
+      const configureButton = document.getElementById("configureButton");
       const autoRefreshStatus = document.getElementById("autoRefreshStatus");
       const panelStatus = document.getElementById("panelStatus");
       const targetDetails = document.getElementById("targetDetails");
@@ -780,6 +948,13 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
         });
       });
 
+      configureButton && configureButton.addEventListener('click', () => {
+        setStatus('pending', 'Opening host app configuration...');
+        vscode.postMessage({
+          type: 'configureHostApp',
+        });
+      });
+
       autoRefreshToggle && autoRefreshToggle.addEventListener('click', () => {
         const nextEnabled = !autoRefreshEnabled;
         setStatus('pending', (nextEnabled ? 'Enabling' : 'Disabling') + ' auto-refresh...');
@@ -860,6 +1035,11 @@ function renderShell(content: string): string {
       .buttonRow {
         display: flex;
         gap: 8px;
+      }
+
+      .configHeader {
+        justify-content: space-between;
+        align-items: center;
       }
 
       button {
@@ -967,6 +1147,7 @@ function isPanelMessage(
 ): value is
   | { type: "openPreview"; payload: OpenPreviewRequest }
   | { type: "refreshPreview" }
+  | { type: "configureHostApp" }
   | { type: "toggleAutoRefresh"; enabled: boolean } {
   if (!value || typeof value !== "object" || !("type" in value)) {
     return false;
@@ -974,6 +1155,10 @@ function isPanelMessage(
 
   const message = value as { type?: unknown; payload?: unknown; enabled?: unknown };
   if (message.type === "refreshPreview") {
+    return true;
+  }
+
+  if (message.type === "configureHostApp") {
     return true;
   }
 
