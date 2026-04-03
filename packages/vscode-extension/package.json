@@ -1,5 +1,5 @@
 {
-  "name": "@swiftui-explorer/vscode-extension",
+  "name": "swiftui-explorer",
   "displayName": "SwiftUI Explorer",
   "version": "0.1.0",
   "description": "Preview and inspect SwiftUI targets from Cursor or VS Code.",
@@ -14,7 +14,8 @@
   "activationEvents": [
     "onCommand:swiftuiExplorer.openPanel",
     "onCommand:swiftuiExplorer.checkRuntime",
-    "onCommand:swiftuiExplorer.openPreview"
+    "onCommand:swiftuiExplorer.openPreview",
+    "onCommand:swiftuiExplorer.refreshPreview"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -30,6 +31,10 @@
       {
         "command": "swiftuiExplorer.openPreview",
         "title": "SwiftUI Explorer: Open Preview In Simulator"
+      },
+      {
+        "command": "swiftuiExplorer.refreshPreview",
+        "title": "SwiftUI Explorer: Refresh Preview"
       }
     ],
     "configuration": {

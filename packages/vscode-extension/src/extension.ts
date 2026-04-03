@@ -55,7 +55,7 @@ type OpenPreviewRequest = {
 
 type OpenPreviewResponse = {
   version: string;
-  status: "launched";
+  status: "launched" | "refreshed";
   appName: string;
   scheme: string;
   simulatorId: string;
@@ -64,6 +64,15 @@ type OpenPreviewResponse = {
   targetId: string;
   fixtureId: string | null;
   environmentId: string | null;
+};
+
+const LAST_PREVIEW_STATE_KEY = "swiftuiExplorer.lastPreviewSelection";
+
+type ExplorerSnapshot = {
+  health: RuntimeHealth;
+  inspection: WorkspaceInspection;
+  discovery: PreviewTargetDiscovery;
+  selection: OpenPreviewRequest | null;
 };
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -112,14 +121,7 @@ export function activate(context: vscode.ExtensionContext): void {
           environmentId: selectedEnvironment.id,
         };
 
-        const launchedPreview = await vscode.window.withProgress<OpenPreviewResponse>(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: `Opening ${selectedTarget.displayName}`,
-            cancellable: false,
-          },
-          async () => postJson<OpenPreviewResponse>(`${baseUrl}/api/v1/preview/open`, payload),
-        );
+        const launchedPreview = await openPreviewSelection(context, baseUrl, payload, selectedTarget.displayName);
 
         vscode.window.showInformationMessage(
           `Opened ${selectedTarget.displayName} in ${launchedPreview.simulatorName}.`,
@@ -129,13 +131,33 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.window.showWarningMessage(`Could not open preview: ${message}`);
       }
     }),
+    vscode.commands.registerCommand("swiftuiExplorer.refreshPreview", async () => {
+      const baseUrl = getRuntimeBaseUrl();
+      const lastPreviewSelection = context.globalState.get<OpenPreviewRequest>(LAST_PREVIEW_STATE_KEY);
+
+      if (!lastPreviewSelection) {
+        vscode.window.showWarningMessage("No previous SwiftUI Explorer preview selection is available yet.");
+        return;
+      }
+
+      try {
+        const refreshedPreview = await refreshPreviewSelection(context, baseUrl, lastPreviewSelection);
+
+        vscode.window.showInformationMessage(
+          `Refreshed ${refreshedPreview.targetId} in ${refreshedPreview.simulatorName}.`,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown runtime error";
+        vscode.window.showWarningMessage(`Could not refresh preview: ${message}`);
+      }
+    }),
     vscode.commands.registerCommand("swiftuiExplorer.openPanel", async () => {
       const panel = vscode.window.createWebviewPanel(
         "swiftuiExplorer",
         "SwiftUI Explorer",
         vscode.ViewColumn.Beside,
         {
-          enableScripts: false,
+          enableScripts: true,
         },
       );
 
@@ -144,13 +166,68 @@ export function activate(context: vscode.ExtensionContext): void {
       const baseUrl = getRuntimeBaseUrl();
 
       try {
-        const [health, inspection, discovery] = await Promise.all([
-          getJson<RuntimeHealth>(`${baseUrl}/health`),
-          getJson<WorkspaceInspection>(`${baseUrl}/api/v1/workspace/inspect`),
-          getJson<PreviewTargetDiscovery>(`${baseUrl}/api/v1/targets`),
-        ]);
+        const snapshot = await loadExplorerSnapshot(context, baseUrl);
+        panel.webview.html = renderPanelHtml(snapshot);
 
-        panel.webview.html = renderPanelHtml(health, inspection, discovery);
+        panel.webview.onDidReceiveMessage(async (message: unknown) => {
+          if (!isPanelMessage(message)) {
+            return;
+          }
+
+          if (message.type === "openPreview") {
+            try {
+              const launchedPreview = await openPreviewSelection(
+                context,
+                baseUrl,
+                message.payload,
+                findTargetDisplayName(snapshot.discovery.targets, message.payload.targetId),
+              );
+
+              panel.webview.postMessage({
+                type: "previewStatus",
+                kind: "success",
+                text: `Opened ${launchedPreview.targetId} in ${launchedPreview.simulatorName}.`,
+              });
+            } catch (error) {
+              const messageText = error instanceof Error ? error.message : "Unknown runtime error";
+              panel.webview.postMessage({
+                type: "previewStatus",
+                kind: "error",
+                text: `Could not open preview: ${messageText}`,
+              });
+            }
+
+            return;
+          }
+
+          if (message.type === "refreshPreview") {
+            try {
+              const lastPreviewSelection = context.globalState.get<OpenPreviewRequest>(LAST_PREVIEW_STATE_KEY);
+              if (!lastPreviewSelection) {
+                throw new Error("No previous SwiftUI Explorer preview selection is available yet.");
+              }
+
+              const refreshedPreview = await refreshPreviewSelection(
+                context,
+                baseUrl,
+                lastPreviewSelection,
+              );
+
+              panel.webview.postMessage({
+                type: "previewStatus",
+                kind: "success",
+                text: `Refreshed ${refreshedPreview.targetId} in ${refreshedPreview.simulatorName}.`,
+              });
+            } catch (error) {
+              const messageText = error instanceof Error ? error.message : "Unknown runtime error";
+              panel.webview.postMessage({
+                type: "previewStatus",
+                kind: "error",
+                text: `Could not refresh preview: ${messageText}`,
+              });
+            }
+          }
+        });
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown runtime error";
         panel.webview.html = renderErrorHtml(baseUrl, message);
@@ -160,6 +237,27 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export function deactivate(): void {}
+
+async function loadExplorerSnapshot(
+  context: vscode.ExtensionContext,
+  baseUrl: string,
+): Promise<ExplorerSnapshot> {
+  const [health, inspection, discovery] = await Promise.all([
+    getJson<RuntimeHealth>(`${baseUrl}/health`),
+    getJson<WorkspaceInspection>(`${baseUrl}/api/v1/workspace/inspect`),
+    getJson<PreviewTargetDiscovery>(`${baseUrl}/api/v1/targets`),
+  ]);
+
+  return {
+    health,
+    inspection,
+    discovery,
+    selection: normalizeSelection(
+      context.globalState.get<OpenPreviewRequest>(LAST_PREVIEW_STATE_KEY),
+      discovery.targets,
+    ),
+  };
+}
 
 function getRuntimeBaseUrl(): string {
   return vscode.workspace
@@ -202,6 +300,51 @@ function getJson<T>(urlString: string): Promise<T> {
       reject(error);
     });
   });
+}
+
+async function openPreviewSelection(
+  context: vscode.ExtensionContext,
+  baseUrl: string,
+  payload: OpenPreviewRequest,
+  targetDisplayName?: string,
+): Promise<OpenPreviewResponse> {
+  const launchedPreview = await vscode.window.withProgress<OpenPreviewResponse>(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: `Opening ${targetDisplayName ?? payload.targetId}`,
+      cancellable: false,
+    },
+    async () => postJson<OpenPreviewResponse>(`${baseUrl}/api/v1/preview/open`, payload),
+  );
+
+  await context.globalState.update(LAST_PREVIEW_STATE_KEY, payload);
+  return launchedPreview;
+}
+
+async function refreshPreviewSelection(
+  context: vscode.ExtensionContext,
+  baseUrl: string,
+  lastPreviewSelection: OpenPreviewRequest,
+): Promise<OpenPreviewResponse> {
+  return vscode.window.withProgress<OpenPreviewResponse>(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "Refreshing SwiftUI preview",
+      cancellable: false,
+    },
+    async () => {
+      try {
+        return await postJson<OpenPreviewResponse>(`${baseUrl}/api/v1/preview/refresh`, {});
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown runtime error";
+        if (!message.includes("No preview has been opened yet")) {
+          throw error;
+        }
+
+        return openPreviewSelection(context, baseUrl, lastPreviewSelection);
+      }
+    },
+  );
 }
 
 function postJson<T>(urlString: string, body: unknown): Promise<T> {
@@ -327,11 +470,8 @@ function renderErrorHtml(baseUrl: string, message: string): string {
   `);
 }
 
-function renderPanelHtml(
-  health: RuntimeHealth,
-  inspection: WorkspaceInspection,
-  discovery: PreviewTargetDiscovery,
-): string {
+function renderPanelHtml(snapshot: ExplorerSnapshot): string {
+  const { health, inspection, discovery, selection } = snapshot;
   const checkItems: Array<[string, boolean]> = [
     ["Package.swift found", inspection.hasPackageSwift],
     ["Xcode project found", inspection.hasXcodeProject],
@@ -343,12 +483,38 @@ function renderPanelHtml(
     .map(([label, ok]) => `<li>${escapeHtml(label)}: <strong>${ok ? "yes" : "no"}</strong></li>`)
     .join("");
 
+  const bootstrapJson = escapeScriptJson(
+    JSON.stringify({
+      targets: discovery.targets,
+      selection,
+    }),
+  );
+
   const targetSummary = discovery.targets.length > 0
     ? `
       <p>Discovered <strong>${discovery.targets.length}</strong> preview target${discovery.targets.length === 1 ? "" : "s"} from <code>${escapeHtml(discovery.appName ?? "unknown app")}</code>.</p>
       <p>Scheme: <code>${escapeHtml(discovery.scheme ?? "unknown")}</code></p>
       <p>Manifest: <code>${escapeHtml(discovery.manifestPath ?? "not found")}</code></p>
-      ${renderTargetsList(discovery.targets)}
+      <div class="controls">
+        <label class="field">
+          <span>Target</span>
+          <select id="targetSelect"></select>
+        </label>
+        <label class="field">
+          <span>Fixture</span>
+          <select id="fixtureSelect"></select>
+        </label>
+        <label class="field">
+          <span>Environment</span>
+          <select id="environmentSelect"></select>
+        </label>
+        <div class="buttonRow">
+          <button id="openButton">Open In Simulator</button>
+          <button id="refreshButton" class="secondary">Refresh Last Preview</button>
+        </div>
+        <p id="panelStatus" class="status">Use the selectors above to launch or refresh a preview.</p>
+      </div>
+      <div id="targetDetails"></div>
     `
     : `
       <p>No preview targets are available yet.</p>
@@ -363,31 +529,190 @@ function renderPanelHtml(
     <ul>${checks}</ul>
     <h2>Preview targets</h2>
     ${targetSummary}
-    <h2>Next step</h2>
+    <h2>Status</h2>
     <p>${escapeHtml(inspection.suggestedNextAction)}</p>
+    <script id="swiftuiExplorerBootstrap" type="application/json">${bootstrapJson}</script>
+    <script>
+      const vscode = acquireVsCodeApi();
+      const bootstrapElement = document.getElementById("swiftuiExplorerBootstrap");
+      const bootstrap = bootstrapElement ? JSON.parse(bootstrapElement.textContent || "{}") : {};
+      const targets = Array.isArray(bootstrap.targets) ? bootstrap.targets : [];
+      const storedSelection = bootstrap.selection || null;
+
+      const targetSelect = document.getElementById("targetSelect");
+      const fixtureSelect = document.getElementById("fixtureSelect");
+      const environmentSelect = document.getElementById("environmentSelect");
+      const openButton = document.getElementById("openButton");
+      const refreshButton = document.getElementById("refreshButton");
+      const panelStatus = document.getElementById("panelStatus");
+      const targetDetails = document.getElementById("targetDetails");
+
+      function currentTarget() {
+        return targets.find((target) => target.id === targetSelect.value) || null;
+      }
+
+      function setStatus(kind, text) {
+        panelStatus.textContent = text;
+        panelStatus.className = "status " + kind;
+      }
+
+      function populateTargets() {
+        targetSelect.innerHTML = targets
+          .map((target) => '<option value="' + escapeAttribute(target.id) + '">' + escapeText(target.displayName) + '</option>')
+          .join("");
+
+        const initialTargetId = storedSelection && storedSelection.targetId
+          ? storedSelection.targetId
+          : (targets[0] ? targets[0].id : "");
+
+        if (initialTargetId) {
+          targetSelect.value = initialTargetId;
+        }
+      }
+
+      function populateFixtures() {
+        const target = currentTarget();
+        if (!target) {
+          fixtureSelect.innerHTML = "";
+          fixtureSelect.disabled = true;
+          return;
+        }
+
+        const fixtures = target.fixtures || [];
+        if (fixtures.length === 0) {
+          fixtureSelect.innerHTML = '<option value="">No fixtures</option>';
+          fixtureSelect.value = "";
+          fixtureSelect.disabled = true;
+          return;
+        }
+
+        fixtureSelect.disabled = false;
+        fixtureSelect.innerHTML = fixtures
+          .map((fixture) => '<option value="' + escapeAttribute(fixture.id) + '">' + escapeText(fixture.displayName) + '</option>')
+          .join("");
+
+        const preferredFixtureId = storedSelection && storedSelection.targetId === target.id
+          ? storedSelection.fixtureId
+          : "";
+        fixtureSelect.value = fixtures.some((fixture) => fixture.id === preferredFixtureId)
+          ? preferredFixtureId
+          : fixtures[0].id;
+      }
+
+      function populateEnvironments() {
+        const target = currentTarget();
+        if (!target) {
+          environmentSelect.innerHTML = "";
+          environmentSelect.disabled = true;
+          return;
+        }
+
+        const environments = target.supportedEnvironments || [];
+        environmentSelect.disabled = environments.length === 0;
+        environmentSelect.innerHTML = environments
+          .map((environment) => '<option value="' + escapeAttribute(environment.id) + '">' + escapeText(environment.displayName) + '</option>')
+          .join("");
+
+        const preferredEnvironmentId = storedSelection && storedSelection.targetId === target.id
+          ? storedSelection.environmentId
+          : "";
+        environmentSelect.value = environments.some((environment) => environment.id === preferredEnvironmentId)
+          ? preferredEnvironmentId
+          : (environments[0] ? environments[0].id : "");
+      }
+
+      function renderDetails() {
+        const target = currentTarget();
+        if (!target) {
+          targetDetails.innerHTML = "";
+          return;
+        }
+
+        const fixtures = (target.fixtures || []).map((fixture) => escapeText(fixture.displayName)).join(", ") || "No fixtures";
+        const environments = (target.supportedEnvironments || []).map((environment) => escapeText(environment.displayName)).join(", ");
+
+        targetDetails.innerHTML =
+          '<div class="detailCard">' +
+            '<h3>' + escapeText(target.displayName) + '</h3>' +
+            '<div><code>' + escapeText(target.id) + '</code></div>' +
+            '<div>Fixtures: ' + fixtures + '</div>' +
+            '<div>Environments: ' + environments + '</div>' +
+          '</div>';
+      }
+
+      function currentPayload() {
+        const target = currentTarget();
+        return {
+          targetId: target ? target.id : "",
+          fixtureId: fixtureSelect.disabled || !fixtureSelect.value ? undefined : fixtureSelect.value,
+          environmentId: environmentSelect.value || undefined,
+        };
+      }
+
+      function syncAll() {
+        populateFixtures();
+        populateEnvironments();
+        renderDetails();
+      }
+
+      function escapeText(value) {
+        return String(value)
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;');
+      }
+
+      function escapeAttribute(value) {
+        return escapeText(value).replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+      }
+
+      if (targets.length > 0) {
+        populateTargets();
+        syncAll();
+      } else {
+        if (openButton) {
+          openButton.disabled = true;
+        }
+        if (refreshButton) {
+          refreshButton.disabled = true;
+        }
+      }
+
+      targetSelect && targetSelect.addEventListener('change', () => {
+        syncAll();
+      });
+
+      openButton && openButton.addEventListener('click', () => {
+        const payload = currentPayload();
+        if (!payload.targetId) {
+          setStatus('error', 'No preview target is selected.');
+          return;
+        }
+
+        setStatus('pending', 'Opening preview in Simulator...');
+        vscode.postMessage({
+          type: 'openPreview',
+          payload,
+        });
+      });
+
+      refreshButton && refreshButton.addEventListener('click', () => {
+        setStatus('pending', 'Refreshing last preview...');
+        vscode.postMessage({
+          type: 'refreshPreview',
+        });
+      });
+
+      window.addEventListener('message', (event) => {
+        const message = event.data;
+        if (!message || message.type !== 'previewStatus') {
+          return;
+        }
+
+        setStatus(message.kind === 'error' ? 'error' : 'success', message.text);
+      });
+    </script>
   `);
-}
-
-function renderTargetsList(targets: PreviewDescriptor[]): string {
-  const items = targets
-    .map((target) => {
-      const fixtures = target.fixtures.length === 0
-        ? "No fixtures"
-        : target.fixtures.map((fixture) => fixture.displayName).join(", ");
-      const environments = target.supportedEnvironments.map((environment) => environment.displayName).join(", ");
-
-      return `
-        <li>
-          <strong>${escapeHtml(target.displayName)}</strong>
-          <div><code>${escapeHtml(target.id)}</code></div>
-          <div>Fixtures: ${escapeHtml(fixtures)}</div>
-          <div>Environments: ${escapeHtml(environments)}</div>
-        </li>
-      `;
-    })
-    .join("");
-
-  return `<ul>${items}</ul>`;
 }
 
 function renderShell(content: string): string {
@@ -415,6 +740,74 @@ function renderShell(content: string): string {
       li {
         margin-bottom: 10px;
       }
+
+      .controls {
+        display: grid;
+        gap: 12px;
+        margin: 16px 0;
+      }
+
+      .field {
+        display: grid;
+        gap: 6px;
+      }
+
+      .field span {
+        font-weight: 600;
+      }
+
+      select {
+        background: var(--vscode-dropdown-background);
+        color: var(--vscode-dropdown-foreground);
+        border: 1px solid var(--vscode-dropdown-border, transparent);
+        padding: 6px 8px;
+      }
+
+      .buttonRow {
+        display: flex;
+        gap: 8px;
+      }
+
+      button {
+        border: 1px solid var(--vscode-button-border, transparent);
+        background: var(--vscode-button-background);
+        color: var(--vscode-button-foreground);
+        padding: 8px 12px;
+        cursor: pointer;
+      }
+
+      button.secondary {
+        background: var(--vscode-button-secondaryBackground);
+        color: var(--vscode-button-secondaryForeground);
+      }
+
+      .status {
+        margin: 0;
+        color: var(--vscode-descriptionForeground);
+      }
+
+      .status.pending {
+        color: var(--vscode-descriptionForeground);
+      }
+
+      .status.success {
+        color: var(--vscode-testing-iconPassed);
+      }
+
+      .status.error {
+        color: var(--vscode-errorForeground);
+      }
+
+      .detailCard {
+        border: 1px solid var(--vscode-panel-border);
+        padding: 12px;
+        border-radius: 6px;
+      }
+
+      .detailCard h3 {
+        margin-top: 0;
+        margin-bottom: 8px;
+      }
     </style>
   </head>
   <body>
@@ -430,4 +823,59 @@ function escapeHtml(value: string): string {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function escapeScriptJson(value: string): string {
+  return value
+    .replaceAll("<", "\\u003c")
+    .replaceAll(">", "\\u003e")
+    .replaceAll("&", "\\u0026");
+}
+
+function normalizeSelection(
+  selection: OpenPreviewRequest | undefined,
+  targets: PreviewDescriptor[],
+): OpenPreviewRequest | null {
+  if (targets.length === 0) {
+    return null;
+  }
+
+  const selectedTarget = targets.find((target) => target.id === selection?.targetId) ?? targets[0];
+  const selectedFixture = selection?.fixtureId && selectedTarget.fixtures.some((fixture) => fixture.id === selection.fixtureId)
+    ? selection.fixtureId
+    : selectedTarget.fixtures[0]?.id;
+  const selectedEnvironment = selection?.environmentId && selectedTarget.supportedEnvironments.some(
+    (environment) => environment.id === selection.environmentId,
+  )
+    ? selection.environmentId
+    : selectedTarget.supportedEnvironments[0]?.id;
+
+  return {
+    targetId: selectedTarget.id,
+    fixtureId: selectedFixture,
+    environmentId: selectedEnvironment,
+  };
+}
+
+function findTargetDisplayName(targets: PreviewDescriptor[], targetId: string): string | undefined {
+  return targets.find((target) => target.id === targetId)?.displayName;
+}
+
+function isPanelMessage(
+  value: unknown,
+): value is { type: "openPreview"; payload: OpenPreviewRequest } | { type: "refreshPreview" } {
+  if (!value || typeof value !== "object" || !("type" in value)) {
+    return false;
+  }
+
+  const message = value as { type?: unknown; payload?: unknown };
+  if (message.type === "refreshPreview") {
+    return true;
+  }
+
+  if (message.type !== "openPreview" || !message.payload || typeof message.payload !== "object") {
+    return false;
+  }
+
+  return "targetId" in (message.payload as object);
 }

@@ -64,7 +64,7 @@ type PreviewOpenRequest = {
 
 type PreviewOpenResponse = {
   version: string;
-  status: "launched";
+  status: "launched" | "refreshed";
   appName: string;
   scheme: string;
   simulatorId: string;
@@ -81,6 +81,13 @@ type SimulatorDevice = {
   state: string;
   isAvailable: boolean;
   runtime: string;
+};
+
+type LastPreviewState = {
+  targetId: string;
+  fixtureId?: string;
+  environmentId?: string;
+  simulatorId?: string;
 };
 
 class HttpError extends Error {
@@ -100,6 +107,7 @@ const execFileAsync = promisify(execFile);
 
 const workspaceRoot = process.env.SWIFTUI_EXPLORER_WORKSPACE_ROOT ?? process.cwd();
 const port = Number.parseInt(process.env.SWIFTUI_EXPLORER_PORT ?? `${DEFAULT_PORT}`, 10);
+let lastPreviewState: LastPreviewState | null = null;
 
 const server = http.createServer((request, response) => {
   handleRequest(request, response).catch((error: unknown) => {
@@ -141,8 +149,18 @@ async function handleRequest(request: http.IncomingMessage, response: http.Serve
 
   if (request.method === "POST" && requestUrl.pathname === "/api/v1/preview/open") {
     const body = await readJsonBody<PreviewOpenRequest>(request);
-    const launchedPreview = await openPreview(workspaceRoot, body);
+    const launchedPreview = await openPreview(workspaceRoot, body, "launched");
     writeJson<PreviewOpenResponse>(response, 200, launchedPreview);
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/v1/preview/refresh") {
+    if (!lastPreviewState) {
+      throw new HttpError(409, "No preview has been opened yet.");
+    }
+
+    const refreshedPreview = await openPreview(workspaceRoot, lastPreviewState, "refreshed");
+    writeJson<PreviewOpenResponse>(response, 200, refreshedPreview);
     return;
   }
 
@@ -200,7 +218,7 @@ function suggestNextAction(input: {
   }
 
   if (input.hasPreviewManifest) {
-    return "Preview targets are available. Next, wire selection into simulator launch and refresh.";
+    return "Preview launch is available. Use Open Preview In Simulator, then Refresh Preview to relaunch the last selection.";
   }
 
   return "Add a preview manifest so the runtime can discover targets and fixtures.";
@@ -228,7 +246,11 @@ function discoverPreviewTargets(root: string): PreviewTargetDiscovery {
   };
 }
 
-async function openPreview(root: string, input: PreviewOpenRequest): Promise<PreviewOpenResponse> {
+async function openPreview(
+  root: string,
+  input: PreviewOpenRequest,
+  status: "launched" | "refreshed",
+): Promise<PreviewOpenResponse> {
   if (!input.targetId) {
     throw new HttpError(400, "targetId is required.");
   }
@@ -251,16 +273,25 @@ async function openPreview(root: string, input: PreviewOpenRequest): Promise<Pre
   const simulator = await resolveSimulator(input.simulatorId);
 
   await ensureSimulatorBooted(simulator.udid);
+  await focusSimulatorApp(simulator.udid);
   const appPath = await buildSampleApp(sampleApp, root, manifest.scheme, simulator.udid);
   await installAndLaunchSampleApp(appPath, simulator.udid, {
     targetId: target.id,
     fixtureId: fixture?.id ?? null,
     environmentId: environment?.id ?? null,
   });
+  await focusSimulatorApp(simulator.udid);
+
+  lastPreviewState = {
+    targetId: target.id,
+    ...(fixture?.id ? { fixtureId: fixture.id } : {}),
+    ...(environment?.id ? { environmentId: environment.id } : {}),
+    simulatorId: simulator.udid,
+  };
 
   return {
     version: VERSION,
-    status: "launched",
+    status,
     appName: manifest.appName,
     scheme: manifest.scheme,
     simulatorId: simulator.udid,
@@ -414,6 +445,31 @@ async function ensureSimulatorBooted(simulatorId: string): Promise<void> {
     allowFailure: true,
   });
   await runCommand("xcrun", ["simctl", "bootstatus", simulatorId, "-b"], workspaceRoot);
+}
+
+async function focusSimulatorApp(simulatorId: string): Promise<void> {
+  await runCommand("open", ["-a", "Simulator", "--args", "-CurrentDeviceUDID", simulatorId], workspaceRoot, {
+    allowFailure: true,
+  });
+  await runCommand(
+    "osascript",
+    [
+      "-e",
+      'tell application "Simulator" to activate',
+      "-e",
+      "delay 0.3",
+      "-e",
+      'tell application "System Events"',
+      "-e",
+      'if exists process "Simulator" then set frontmost of process "Simulator" to true',
+      "-e",
+      "end tell",
+    ],
+    workspaceRoot,
+    {
+      allowFailure: true,
+    },
+  );
 }
 
 async function buildSampleApp(
