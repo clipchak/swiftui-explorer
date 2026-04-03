@@ -8,13 +8,24 @@ struct PreviewHostRootView: View {
     @State private var selectedFixtureID: String
     @State private var selectedEnvironmentID: String
 
-    init(registry: some SwiftPreviewKit.PreviewRegistry) {
+    init(
+        registry: some SwiftPreviewKit.PreviewRegistry,
+        launchSelection: PreviewLaunchSelection = PreviewLaunchSelection(
+            targetID: nil,
+            fixtureID: nil,
+            environmentID: nil
+        )
+    ) {
         let previews = registry.allPreviews()
         self.previews = previews
 
-        let initialPreview = previews.first
-        let initialFixtureID = initialPreview?.descriptor.fixtures.first?.id ?? ""
-        let initialEnvironmentID = initialPreview?.descriptor.supportedEnvironments.first?.id ?? PreviewEnvironment.defaultLight.id
+        let initialPreview = previews.first(where: { $0.id == launchSelection.targetID }) ?? previews.first
+        let initialFixtureID = initialPreview?.descriptor.fixtures.first(where: { $0.id == launchSelection.fixtureID })?.id
+            ?? initialPreview?.descriptor.fixtures.first?.id
+            ?? ""
+        let initialEnvironmentID = initialPreview?.descriptor.supportedEnvironments.first(where: { $0.id == launchSelection.environmentID })?.id
+            ?? initialPreview?.descriptor.supportedEnvironments.first?.id
+            ?? PreviewEnvironment.defaultLight.id
 
         _selectedPreviewID = State(initialValue: initialPreview?.descriptor.id ?? "")
         _selectedFixtureID = State(initialValue: initialFixtureID)

@@ -1,6 +1,8 @@
 import * as http from "node:http";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import * as path from "node:path";
+import { promisify } from "node:util";
 
 type HealthResponse = {
   version: string;
@@ -53,14 +55,69 @@ type PreviewTargetDiscovery = {
   targets: PreviewDescriptor[];
 };
 
+type PreviewOpenRequest = {
+  targetId: string;
+  fixtureId?: string;
+  environmentId?: string;
+  simulatorId?: string;
+};
+
+type PreviewOpenResponse = {
+  version: string;
+  status: "launched";
+  appName: string;
+  scheme: string;
+  simulatorId: string;
+  simulatorName: string;
+  bundleIdentifier: string;
+  targetId: string;
+  fixtureId: string | null;
+  environmentId: string | null;
+};
+
+type SimulatorDevice = {
+  udid: string;
+  name: string;
+  state: string;
+  isAvailable: boolean;
+  runtime: string;
+};
+
+class HttpError extends Error {
+  statusCode: number;
+
+  constructor(statusCode: number, message: string) {
+    super(message);
+    this.statusCode = statusCode;
+  }
+}
+
 const VERSION = "0.1.0";
 const SERVICE = "swiftui-explorer-preview-cli";
 const DEFAULT_PORT = 4123;
+const SAMPLE_APP_BUNDLE_IDENTIFIER = "com.swiftuiexplorer.example.SampleSwiftUIApp";
+const execFileAsync = promisify(execFile);
 
 const workspaceRoot = process.env.SWIFTUI_EXPLORER_WORKSPACE_ROOT ?? process.cwd();
 const port = Number.parseInt(process.env.SWIFTUI_EXPLORER_PORT ?? `${DEFAULT_PORT}`, 10);
 
 const server = http.createServer((request, response) => {
+  handleRequest(request, response).catch((error: unknown) => {
+    const statusCode = error instanceof HttpError ? error.statusCode : 500;
+    const message = error instanceof Error ? error.message : "Unknown runtime error";
+
+    writeJson(response, statusCode, {
+      version: VERSION,
+      error: message,
+    });
+  });
+});
+
+server.listen(port, "127.0.0.1", () => {
+  process.stdout.write(`[swiftui-explorer] runtime listening on http://127.0.0.1:${port}\n`);
+});
+
+async function handleRequest(request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
   const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
 
   if (request.method === "GET" && requestUrl.pathname === "/health") {
@@ -82,15 +139,18 @@ const server = http.createServer((request, response) => {
     return;
   }
 
+  if (request.method === "POST" && requestUrl.pathname === "/api/v1/preview/open") {
+    const body = await readJsonBody<PreviewOpenRequest>(request);
+    const launchedPreview = await openPreview(workspaceRoot, body);
+    writeJson<PreviewOpenResponse>(response, 200, launchedPreview);
+    return;
+  }
+
   writeJson(response, 404, {
     version: VERSION,
     error: "Not found",
   });
-});
-
-server.listen(port, "127.0.0.1", () => {
-  process.stdout.write(`[swiftui-explorer] runtime listening on http://127.0.0.1:${port}\n`);
-});
+}
 
 function inspectWorkspace(root: string): WorkspaceInspection {
   const hasPackageSwift = hasPathSuffix(root, "Package.swift");
@@ -168,19 +228,68 @@ function discoverPreviewTargets(root: string): PreviewTargetDiscovery {
   };
 }
 
+async function openPreview(root: string, input: PreviewOpenRequest): Promise<PreviewOpenResponse> {
+  if (!input.targetId) {
+    throw new HttpError(400, "targetId is required.");
+  }
+
+  const sampleApp = getSampleAppPaths(root);
+  await ensureSampleProject(sampleApp, root);
+
+  const manifest = readPreviewManifest(sampleApp.manifestPath);
+  if (!manifest) {
+    throw new HttpError(400, "Preview manifest is missing or invalid.");
+  }
+
+  const target = manifest.targets.find((candidate) => candidate.id === input.targetId);
+  if (!target) {
+    throw new HttpError(404, `Unknown preview target: ${input.targetId}`);
+  }
+
+  const fixture = resolveFixture(target, input.fixtureId);
+  const environment = resolveEnvironment(target, input.environmentId);
+  const simulator = await resolveSimulator(input.simulatorId);
+
+  await ensureSimulatorBooted(simulator.udid);
+  const appPath = await buildSampleApp(sampleApp, root, manifest.scheme, simulator.udid);
+  await installAndLaunchSampleApp(appPath, simulator.udid, {
+    targetId: target.id,
+    fixtureId: fixture?.id ?? null,
+    environmentId: environment?.id ?? null,
+  });
+
+  return {
+    version: VERSION,
+    status: "launched",
+    appName: manifest.appName,
+    scheme: manifest.scheme,
+    simulatorId: simulator.udid,
+    simulatorName: simulator.name,
+    bundleIdentifier: SAMPLE_APP_BUNDLE_IDENTIFIER,
+    targetId: target.id,
+    fixtureId: fixture?.id ?? null,
+    environmentId: environment?.id ?? null,
+  };
+}
+
 function getSampleAppPaths(root: string): {
   sampleRoot: string;
   specPath: string;
   projectPath: string;
   manifestPath: string;
+  derivedDataPath: string;
+  appPath: string;
 } {
   const sampleRoot = path.join(root, "examples", "sample-swiftui-app");
+  const derivedDataPath = path.join(root, ".swiftui-explorer", "derived-data", "sample-swiftui-app");
 
   return {
     sampleRoot,
     specPath: path.join(sampleRoot, "project.yml"),
     projectPath: path.join(sampleRoot, "SampleSwiftUIApp.xcodeproj"),
     manifestPath: path.join(sampleRoot, "SampleSwiftUIApp", "Resources", "PreviewManifest.json"),
+    derivedDataPath,
+    appPath: path.join(derivedDataPath, "Build", "Products", "Debug-iphonesimulator", "SampleSwiftUIApp.app"),
   };
 }
 
@@ -193,6 +302,235 @@ function readPreviewManifest(manifestPath: string): PreviewManifest | null {
     return JSON.parse(readFileSync(manifestPath, "utf8")) as PreviewManifest;
   } catch {
     return null;
+  }
+}
+
+async function ensureSampleProject(
+  sampleApp: ReturnType<typeof getSampleAppPaths>,
+  root: string,
+): Promise<void> {
+  if (existsSync(sampleApp.projectPath)) {
+    return;
+  }
+
+  if (!existsSync(sampleApp.specPath)) {
+    throw new HttpError(400, "Sample app project spec was not found.");
+  }
+
+  await runCommand("xcodegen", ["generate", "--spec", sampleApp.specPath], root);
+}
+
+function resolveFixture(target: PreviewDescriptor, fixtureId?: string): PreviewFixture | null {
+  if (!fixtureId) {
+    return target.fixtures[0] ?? null;
+  }
+
+  const fixture = target.fixtures.find((candidate) => candidate.id === fixtureId);
+  if (!fixture) {
+    throw new HttpError(400, `Unknown fixture '${fixtureId}' for target '${target.id}'.`);
+  }
+
+  return fixture;
+}
+
+function resolveEnvironment(target: PreviewDescriptor, environmentId?: string): PreviewEnvironment | null {
+  if (!environmentId) {
+    return target.supportedEnvironments[0] ?? null;
+  }
+
+  const environment = target.supportedEnvironments.find((candidate) => candidate.id === environmentId);
+  if (!environment) {
+    throw new HttpError(400, `Unknown environment '${environmentId}' for target '${target.id}'.`);
+  }
+
+  return environment;
+}
+
+async function resolveSimulator(requestedSimulatorId?: string): Promise<SimulatorDevice> {
+  const simulators = await listAvailableSimulators();
+
+  if (requestedSimulatorId) {
+    const match = simulators.find((simulator) => simulator.udid === requestedSimulatorId);
+    if (!match) {
+      throw new HttpError(404, `Simulator '${requestedSimulatorId}' was not found.`);
+    }
+    return match;
+  }
+
+  const bootedSimulator = simulators.find((simulator) => simulator.state === "Booted");
+  if (bootedSimulator) {
+    return bootedSimulator;
+  }
+
+  const preferredNames = ["iPhone 16 Pro", "iPhone 16", "iPhone 15 Pro"];
+  for (const preferredName of preferredNames) {
+    const match = simulators.find((simulator) => simulator.name === preferredName);
+    if (match) {
+      return match;
+    }
+  }
+
+  const fallback = simulators.find((simulator) => simulator.name.startsWith("iPhone"));
+  if (fallback) {
+    return fallback;
+  }
+
+  throw new HttpError(500, "No available iOS simulators were found.");
+}
+
+async function listAvailableSimulators(): Promise<SimulatorDevice[]> {
+  const { stdout } = await runCommand("xcrun", ["simctl", "list", "devices", "available", "-j"], workspaceRoot);
+  const parsed = JSON.parse(stdout) as {
+    devices?: Record<string, Array<{ udid: string; name: string; state: string; isAvailable: boolean }>>;
+  };
+
+  const simulators: SimulatorDevice[] = [];
+
+  for (const [runtime, devices] of Object.entries(parsed.devices ?? {})) {
+    if (!runtime.includes("iOS")) {
+      continue;
+    }
+
+    for (const device of devices) {
+      if (!device.isAvailable) {
+        continue;
+      }
+
+      simulators.push({
+        udid: device.udid,
+        name: device.name,
+        state: device.state,
+        isAvailable: device.isAvailable,
+        runtime,
+      });
+    }
+  }
+
+  return simulators;
+}
+
+async function ensureSimulatorBooted(simulatorId: string): Promise<void> {
+  await runCommand("xcrun", ["simctl", "boot", simulatorId], workspaceRoot, {
+    allowFailure: true,
+  });
+  await runCommand("xcrun", ["simctl", "bootstatus", simulatorId, "-b"], workspaceRoot);
+}
+
+async function buildSampleApp(
+  sampleApp: ReturnType<typeof getSampleAppPaths>,
+  root: string,
+  scheme: string,
+  simulatorId: string,
+): Promise<string> {
+  mkdirSync(sampleApp.derivedDataPath, {
+    recursive: true,
+  });
+
+  await runCommand(
+    "xcodebuild",
+    [
+      "-project",
+      sampleApp.projectPath,
+      "-scheme",
+      scheme,
+      "-destination",
+      `id=${simulatorId}`,
+      "-derivedDataPath",
+      sampleApp.derivedDataPath,
+      "build",
+    ],
+    root,
+  );
+
+  if (!existsSync(sampleApp.appPath)) {
+    throw new HttpError(500, `Built app not found at '${sampleApp.appPath}'.`);
+  }
+
+  return sampleApp.appPath;
+}
+
+async function installAndLaunchSampleApp(
+  appPath: string,
+  simulatorId: string,
+  selection: {
+    targetId: string;
+    fixtureId: string | null;
+    environmentId: string | null;
+  },
+): Promise<void> {
+  await runCommand("xcrun", ["simctl", "install", simulatorId, appPath], workspaceRoot);
+
+  await runCommand(
+    "xcrun",
+    ["simctl", "launch", "--terminate-running-process", simulatorId, SAMPLE_APP_BUNDLE_IDENTIFIER],
+    workspaceRoot,
+    {
+      env: {
+        SIMCTL_CHILD_SWIFTUI_EXPLORER_TARGET_ID: selection.targetId,
+        ...(selection.fixtureId ? { SIMCTL_CHILD_SWIFTUI_EXPLORER_FIXTURE_ID: selection.fixtureId } : {}),
+        ...(selection.environmentId ? { SIMCTL_CHILD_SWIFTUI_EXPLORER_ENVIRONMENT_ID: selection.environmentId } : {}),
+      },
+    },
+  );
+}
+
+async function readJsonBody<T>(request: http.IncomingMessage): Promise<T> {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of request) {
+    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+  }
+
+  const body = Buffer.concat(chunks).toString("utf8");
+
+  if (!body) {
+    throw new HttpError(400, "Request body is required.");
+  }
+
+  try {
+    return JSON.parse(body) as T;
+  } catch {
+    throw new HttpError(400, "Request body must be valid JSON.");
+  }
+}
+
+async function runCommand(
+  command: string,
+  args: string[],
+  cwd: string,
+  options?: {
+    env?: NodeJS.ProcessEnv;
+    allowFailure?: boolean;
+  },
+): Promise<{ stdout: string; stderr: string }> {
+  try {
+    const result = await execFileAsync(command, args, {
+      cwd,
+      env: {
+        ...process.env,
+        ...options?.env,
+      },
+      maxBuffer: 10 * 1024 * 1024,
+    });
+
+    return {
+      stdout: result.stdout,
+      stderr: result.stderr,
+    };
+  } catch (error) {
+    if (options?.allowFailure) {
+      return {
+        stdout: "",
+        stderr: "",
+      };
+    }
+
+    const stderr = typeof error === "object" && error !== null && "stderr" in error ? String(error.stderr) : "";
+    const stdout = typeof error === "object" && error !== null && "stdout" in error ? String(error.stdout) : "";
+    const details = [stderr, stdout].filter(Boolean).join("\n").trim();
+    const message = details ? `${command} failed: ${details}` : `${command} failed.`;
+
+    throw new HttpError(500, message);
   }
 }
 

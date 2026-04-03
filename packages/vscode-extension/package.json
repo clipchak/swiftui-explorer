@@ -13,7 +13,8 @@
   ],
   "activationEvents": [
     "onCommand:swiftuiExplorer.openPanel",
-    "onCommand:swiftuiExplorer.checkRuntime"
+    "onCommand:swiftuiExplorer.checkRuntime",
+    "onCommand:swiftuiExplorer.openPreview"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -25,6 +26,10 @@
       {
         "command": "swiftuiExplorer.checkRuntime",
         "title": "SwiftUI Explorer: Check Runtime"
+      },
+      {
+        "command": "swiftuiExplorer.openPreview",
+        "title": "SwiftUI Explorer: Open Preview In Simulator"
       }
     ],
     "configuration": {

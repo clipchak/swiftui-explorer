@@ -4,6 +4,7 @@ dist
 .swiftpm
 .build
 DerivedData
+.swiftui-explorer
 *.xcworkspace/xcuserdata
 *.xcodeproj/xcuserdata
 packages/vscode-extension/.vscode-test

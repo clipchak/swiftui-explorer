@@ -47,6 +47,25 @@ type PreviewTargetDiscovery = {
   targets: PreviewDescriptor[];
 };
 
+type OpenPreviewRequest = {
+  targetId: string;
+  fixtureId?: string;
+  environmentId?: string;
+};
+
+type OpenPreviewResponse = {
+  version: string;
+  status: "launched";
+  appName: string;
+  scheme: string;
+  simulatorId: string;
+  simulatorName: string;
+  bundleIdentifier: string;
+  targetId: string;
+  fixtureId: string | null;
+  environmentId: string | null;
+};
+
 export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand("swiftuiExplorer.checkRuntime", async () => {
@@ -60,6 +79,54 @@ export function activate(context: vscode.ExtensionContext): void {
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown runtime error";
         vscode.window.showWarningMessage(`SwiftUI Explorer runtime is unavailable: ${message}`);
+      }
+    }),
+    vscode.commands.registerCommand("swiftuiExplorer.openPreview", async () => {
+      const baseUrl = getRuntimeBaseUrl();
+
+      try {
+        const discovery = await getJson<PreviewTargetDiscovery>(`${baseUrl}/api/v1/targets`);
+        if (discovery.targets.length === 0) {
+          vscode.window.showWarningMessage("SwiftUI Explorer did not find any preview targets.");
+          return;
+        }
+
+        const selectedTarget = await pickTarget(discovery.targets);
+        if (!selectedTarget) {
+          return;
+        }
+
+        const selectedFixture = await pickFixture(selectedTarget);
+        if (selectedFixture === undefined) {
+          return;
+        }
+
+        const selectedEnvironment = await pickEnvironment(selectedTarget);
+        if (!selectedEnvironment) {
+          return;
+        }
+
+        const payload: OpenPreviewRequest = {
+          targetId: selectedTarget.id,
+          fixtureId: selectedFixture?.id,
+          environmentId: selectedEnvironment.id,
+        };
+
+        const launchedPreview = await vscode.window.withProgress<OpenPreviewResponse>(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: `Opening ${selectedTarget.displayName}`,
+            cancellable: false,
+          },
+          async () => postJson<OpenPreviewResponse>(`${baseUrl}/api/v1/preview/open`, payload),
+        );
+
+        vscode.window.showInformationMessage(
+          `Opened ${selectedTarget.displayName} in ${launchedPreview.simulatorName}.`,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown runtime error";
+        vscode.window.showWarningMessage(`Could not open preview: ${message}`);
       }
     }),
     vscode.commands.registerCommand("swiftuiExplorer.openPanel", async () => {
@@ -135,6 +202,113 @@ function getJson<T>(urlString: string): Promise<T> {
       reject(error);
     });
   });
+}
+
+function postJson<T>(urlString: string, body: unknown): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const url = new URL(urlString);
+    const client = url.protocol === "https:" ? https : http;
+    const payload = JSON.stringify(body);
+
+    const request = client.request(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "content-length": Buffer.byteLength(payload),
+        },
+      },
+      (response) => {
+        const statusCode = response.statusCode;
+        if (!statusCode) {
+          reject(new Error("Runtime did not return a status code."));
+          return;
+        }
+
+        let responseBody = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          responseBody += chunk;
+        });
+        response.on("end", () => {
+          try {
+            const parsed = JSON.parse(responseBody) as T & { error?: string };
+            if (statusCode >= 400) {
+              reject(new Error(parsed.error ?? `Runtime returned HTTP ${statusCode}.`));
+              return;
+            }
+            resolve(parsed as T);
+          } catch (error) {
+            reject(error);
+          }
+        });
+      },
+    );
+
+    request.on("error", (error) => {
+      reject(error);
+    });
+
+    request.write(payload);
+    request.end();
+  });
+}
+
+async function pickTarget(targets: PreviewDescriptor[]): Promise<PreviewDescriptor | undefined> {
+  const selection = await vscode.window.showQuickPick(
+    targets.map((target) => ({
+      label: target.displayName,
+      description: target.id,
+      detail: `${target.fixtures.length} fixture(s), ${target.supportedEnvironments.length} environment(s)`,
+      target,
+    })),
+    {
+      title: "Select SwiftUI preview target",
+      matchOnDescription: true,
+      matchOnDetail: true,
+    },
+  );
+
+  return selection?.target;
+}
+
+async function pickFixture(target: PreviewDescriptor): Promise<PreviewFixture | null | undefined> {
+  if (target.fixtures.length === 0) {
+    return null;
+  }
+
+  const selection = await vscode.window.showQuickPick(
+    target.fixtures.map((fixture) => ({
+      label: fixture.displayName,
+      description: fixture.id,
+      fixture,
+    })),
+    {
+      title: `Select fixture for ${target.displayName}`,
+      matchOnDescription: true,
+    },
+  );
+
+  return selection?.fixture;
+}
+
+async function pickEnvironment(target: PreviewDescriptor): Promise<PreviewEnvironment | undefined> {
+  const selection = await vscode.window.showQuickPick(
+    target.supportedEnvironments.map((environment) => ({
+      label: environment.displayName,
+      description: environment.id,
+      detail: `${environment.colorScheme}, ${environment.dynamicTypeSize}, ${environment.localeIdentifier}`,
+      environment,
+    })),
+    {
+      title: `Select environment for ${target.displayName}`,
+      matchOnDescription: true,
+      matchOnDetail: true,
+    },
+  );
+
+  return selection?.environment;
 }
 
 function renderLoadingHtml(): string {
