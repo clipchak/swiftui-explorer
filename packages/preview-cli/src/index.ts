@@ -81,6 +81,12 @@ type AutoRefreshState = {
   enabled: boolean;
 };
 
+type ValidationResult = {
+  version: string;
+  success: boolean;
+  diagnostics: string[];
+};
+
 type HostAppConfiguration = {
   version: string;
   usingDefault: boolean;
@@ -249,6 +255,12 @@ async function handleRequest(request: http.IncomingMessage, response: http.Serve
     );
 
     writeJson<AutoRefreshState>(response, 200, getAutoRefreshStateResponse());
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/v1/validate") {
+    const validation = await validateHostAppBuild(workspaceRoot);
+    writeJson<ValidationResult>(response, 200, validation);
     return;
   }
 
@@ -933,6 +945,55 @@ async function buildHostApp(
   }
 
   return appPath;
+}
+
+async function validateHostAppBuild(root: string): Promise<ValidationResult> {
+  const hostApp = resolveHostAppConfiguration(root);
+
+  const buildTargetArgs = hostApp.workspacePath
+    ? ["-workspace", hostApp.workspacePath]
+    : hostApp.projectPath
+    ? ["-project", hostApp.projectPath]
+    : [];
+
+  if (buildTargetArgs.length === 0) {
+    return {
+      version: VERSION,
+      success: false,
+      diagnostics: ["No Xcode project or workspace configured."],
+    };
+  }
+
+  try {
+    await runCommand(
+      "xcodebuild",
+      [
+        ...buildTargetArgs,
+        "-scheme",
+        hostApp.scheme,
+        "-destination",
+        "generic/platform=iOS Simulator",
+        "-derivedDataPath",
+        hostApp.derivedDataPath,
+        "build",
+      ],
+      root,
+    );
+
+    return { version: VERSION, success: true, diagnostics: [] };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Build failed";
+    const diagnostics = message
+      .split("\n")
+      .filter((line) => /error:/i.test(line))
+      .slice(0, 20);
+
+    return {
+      version: VERSION,
+      success: false,
+      diagnostics: diagnostics.length > 0 ? diagnostics : [message.slice(0, 1000)],
+    };
+  }
 }
 
 function parseBuildSetting(output: string, key: string): string | null {

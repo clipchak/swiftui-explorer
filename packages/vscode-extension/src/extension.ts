@@ -245,6 +245,24 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.window.showErrorMessage(`Could not set up previews: ${message}`);
       }
     }),
+    vscode.commands.registerCommand("swiftuiExplorer.generateWithAI", async () => {
+      const baseUrl = getRuntimeBaseUrl();
+
+      try {
+        const result = await generateAdaptersWithAI(context, baseUrl);
+        if (!result) {
+          return;
+        }
+
+        const summary = result.failed > 0
+          ? `AI generated ${result.generated} adapter${result.generated === 1 ? "" : "s"}, ${result.failed} could not be generated.`
+          : `AI generated ${result.generated} adapter${result.generated === 1 ? "" : "s"} successfully.`;
+        vscode.window.showInformationMessage(summary);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown error";
+        vscode.window.showErrorMessage(`AI adapter generation failed: ${message}`);
+      }
+    }),
     vscode.commands.registerCommand("swiftuiExplorer.openPanel", async () => {
       const panel = vscode.window.createWebviewPanel(
         "swiftuiExplorer",
@@ -349,6 +367,41 @@ export function activate(context: vscode.ExtensionContext): void {
                 text: `Could not set up previews: ${messageText}`,
               });
               vscode.window.showErrorMessage(`Could not set up previews: ${messageText}`);
+            }
+
+            return;
+          }
+
+          if (message.type === "generateWithAI") {
+            try {
+              const result = await generateAdaptersWithAI(context, baseUrl);
+              if (!result) {
+                panel.webview.postMessage({
+                  type: "previewStatus",
+                  kind: "success",
+                  text: "AI generation canceled.",
+                });
+                return;
+              }
+
+              snapshot = await loadExplorerSnapshot(context, baseUrl);
+              panel.webview.html = renderPanelHtml(snapshot);
+
+              const summary = result.failed > 0
+                ? `AI generated ${result.generated} adapter${result.generated === 1 ? "" : "s"}, ${result.failed} could not be generated.`
+                : `AI generated ${result.generated} adapter${result.generated === 1 ? "" : "s"} successfully.`;
+              panel.webview.postMessage({
+                type: "previewStatus",
+                kind: result.failed > 0 ? "error" : "success",
+                text: summary,
+              });
+            } catch (error) {
+              const messageText = error instanceof Error ? error.message : "Unknown error";
+              panel.webview.postMessage({
+                type: "previewStatus",
+                kind: "error",
+                text: `AI generation failed: ${messageText}`,
+              });
             }
 
             return;
@@ -751,6 +804,283 @@ async function setupPreviewsForConfiguredHostApp(
   };
 }
 
+type AIGenerationResult = {
+  generated: number;
+  failed: number;
+  adapterFilePath: string;
+  validation?: { success: boolean; diagnostics: string[] };
+};
+
+async function generateAdaptersWithAI(
+  context: vscode.ExtensionContext,
+  baseUrl: string,
+): Promise<AIGenerationResult | undefined> {
+  await ensureRuntimeReady(context);
+
+  const hostApp = await getJson<HostAppConfiguration>(`${baseUrl}/api/v1/config`);
+
+  const appEntryCandidates = await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: "Scanning for app entry files..." },
+    async () => findAppEntryCandidates(hostApp.appRoot),
+  );
+  if (appEntryCandidates.length === 0) {
+    throw new Error("No app entry found. Run 'Generate Adapters' first.");
+  }
+
+  const selectedAppEntry = await pickAppEntryCandidate(appEntryCandidates);
+  if (!selectedAppEntry) {
+    return undefined;
+  }
+
+  const adapterFilePath = path.join(path.dirname(selectedAppEntry.filePath), "SwiftUIExplorerPreviewAdapters.swift");
+  if (!existsSync(adapterFilePath)) {
+    throw new Error("Adapter file not found. Run 'Generate Adapters' first to create the initial scaffold.");
+  }
+
+  const adapterContent = readFileSync(adapterFilePath, "utf8");
+
+  const viewCandidates = findSwiftUIViewCandidates(hostApp.appRoot, selectedAppEntry.filePath);
+  const placeholderViews = viewCandidates.filter((view) => {
+    const adapterName = `render${sanitizeSwiftIdentifier(view.typeName)}`;
+    return adapterContent.includes(`static func ${adapterName}(`) && adapterContent.includes("ContentUnavailableView");
+  });
+
+  if (placeholderViews.length === 0) {
+    vscode.window.showInformationMessage("All adapters are already implemented.");
+    return undefined;
+  }
+
+  const selectedItems = await vscode.window.showQuickPick(
+    placeholderViews.map((view) => ({
+      label: view.displayName,
+      description: view.relativePath,
+      detail: `render${sanitizeSwiftIdentifier(view.typeName)}`,
+      picked: true,
+      view,
+    })),
+    {
+      title: "Select Views for AI Adapter Generation",
+      placeHolder: "Choose views whose adapters should be generated by AI.",
+      canPickMany: true,
+      ignoreFocusOut: true,
+      matchOnDescription: true,
+    },
+  );
+  if (!selectedItems || selectedItems.length === 0) {
+    return undefined;
+  }
+
+  const views = selectedItems.map((item) => item.view);
+
+  const models = await vscode.lm.selectChatModels({});
+  if (models.length === 0) {
+    throw new Error("No language models available. Make sure you have a model configured in your editor.");
+  }
+  const model = models[0];
+
+  let generated = 0;
+  let failed = 0;
+
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "Generating adapters with AI...",
+      cancellable: true,
+    },
+    async (progress, token) => {
+      for (let i = 0; i < views.length; i++) {
+        if (token.isCancellationRequested) {
+          break;
+        }
+
+        const view = views[i];
+        progress.report({
+          message: `${view.displayName} (${i + 1}/${views.length})`,
+          increment: 100 / views.length,
+        });
+
+        try {
+          const viewContext = gatherViewContext(view, hostApp.appRoot);
+          const adapterBody = await callModelForAdapter(model, view, viewContext, token);
+
+          if (adapterBody) {
+            replaceAdapterBody(adapterFilePath, view, adapterBody);
+            generated++;
+          } else {
+            failed++;
+          }
+        } catch {
+          failed++;
+        }
+      }
+    },
+  );
+
+  if (generated > 0) {
+    updateManifestStatuses(hostApp.manifestPath, views, adapterFilePath);
+  }
+
+  let validation: { success: boolean; diagnostics: string[] } | undefined;
+  if (generated > 0) {
+    try {
+      const validationResult = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: "Validating generated adapters..." },
+        async () => postJson<{ success: boolean; diagnostics: string[] }>(`${baseUrl}/api/v1/validate`, {}),
+      );
+      validation = validationResult;
+
+      if (!validationResult.success) {
+        vscode.window.showWarningMessage(
+          `Build validation found issues: ${validationResult.diagnostics.slice(0, 3).join("; ")}`,
+        );
+      }
+    } catch { /* validation is optional, don't block */ }
+  }
+
+  return { generated, failed, adapterFilePath, validation };
+}
+
+function gatherViewContext(view: ViewCandidate, appRoot: string): string {
+  const viewSource = readFileSync(view.filePath, "utf8");
+  const viewDir = path.dirname(view.filePath);
+
+  let relatedContext = "";
+  try {
+    const dirFiles = readdirSync(viewDir).filter(
+      (f) => f.endsWith(".swift") && f !== path.basename(view.filePath),
+    );
+
+    const baseName = view.typeName.replace(/View$/, "");
+    const relatedFiles = dirFiles.filter((f) => f.includes(baseName));
+
+    for (const relatedFile of relatedFiles.slice(0, 3)) {
+      try {
+        const content = readFileSync(path.join(viewDir, relatedFile), "utf8");
+        const truncated = content.length > 4000 ? `${content.slice(0, 4000)}\n// ...(truncated)` : content;
+        relatedContext += `\n// Related file: ${relatedFile}\n${truncated}\n`;
+      } catch { /* skip */ }
+    }
+  } catch { /* skip */ }
+
+  return `${viewSource}${relatedContext}`;
+}
+
+async function callModelForAdapter(
+  model: vscode.LanguageModelChat,
+  view: ViewCandidate,
+  viewContext: string,
+  token: vscode.CancellationToken,
+): Promise<string | null> {
+  const adapterName = `render${sanitizeSwiftIdentifier(view.typeName)}`;
+
+  const prompt = [
+    "You are generating a SwiftUI preview adapter function for the SwiftUI Explorer tool.",
+    "",
+    `Your task: Write the body of this Swift function:`,
+    "",
+    "    @ViewBuilder",
+    `    static func ${adapterName}(_ context: SwiftUIExplorerPreviewContext) -> some View {`,
+    "        // YOUR CODE HERE",
+    "    }",
+    "",
+    `The function should return an instance of ${view.typeName} with reasonable default/preview arguments.`,
+    "",
+    "Rules:",
+    "- Output ONLY the Swift code that goes inside the function body. No function signature, no closing brace.",
+    "- Use the simplest working initializer you can find in the source code.",
+    "- If the view needs a ViewModel or ObservableObject, try .init() or a no-arg convenience initializer.",
+    "- If you find an existing #Preview or PreviewProvider in the source, mirror the same approach.",
+    "- If the view has @EnvironmentObject or @Environment dependencies, wrap with .environmentObject() or .environment().",
+    "- If you genuinely cannot determine a valid initializer, output exactly the word: PLACEHOLDER",
+    "- Do not invent APIs or types that are not visible in the provided source.",
+    "- Do not add import statements.",
+    "- Indent with 8 spaces (two levels of 4-space indentation).",
+    "",
+    "SwiftUIExplorerPreviewContext has:",
+    "  - fixture: SwiftUIExplorerPreviewFixture? (has id: String, displayName: String)",
+    "  - environment: SwiftUIExplorerPreviewEnvironment (has colorScheme, localeIdentifier, dynamicTypeSize)",
+    "",
+    "Source code context:",
+    "```swift",
+    viewContext,
+    "```",
+  ].join("\n");
+
+  const messages = [vscode.LanguageModelChatMessage.User(prompt)];
+
+  try {
+    const response = await model.sendRequest(messages, {}, token);
+    let result = "";
+    for await (const chunk of response.text) {
+      result += chunk;
+    }
+
+    result = result.trim();
+    result = result.replace(/^```\w*\n?/, "").replace(/\n?```$/, "").trim();
+
+    if (result === "PLACEHOLDER" || !result) {
+      return null;
+    }
+
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+function replaceAdapterBody(adapterFilePath: string, view: ViewCandidate, newBody: string): void {
+  let content = readFileSync(adapterFilePath, "utf8");
+  const adapterName = `render${sanitizeSwiftIdentifier(view.typeName)}`;
+
+  const funcPattern = new RegExp(`static func ${escapeRegExp(adapterName)}\\([^)]*\\)[^{]*\\{`);
+  const match = funcPattern.exec(content);
+  if (!match || match.index === undefined) {
+    return;
+  }
+
+  const openBraceIndex = match.index + match[0].length - 1;
+  const closeBraceIndex = findMatchingBrace(content, openBraceIndex);
+  if (closeBraceIndex === -1) {
+    return;
+  }
+
+  content = `${content.slice(0, openBraceIndex + 1)}\n${newBody}\n    ${content.slice(closeBraceIndex)}`;
+  writeFileSync(adapterFilePath, content, "utf8");
+}
+
+function updateManifestStatuses(manifestPath: string, views: ViewCandidate[], adapterFilePath: string): void {
+  if (!existsSync(manifestPath)) {
+    return;
+  }
+
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    if (!Array.isArray(manifest?.targets)) {
+      return;
+    }
+
+    const adapterContent = readFileSync(adapterFilePath, "utf8");
+
+    for (const target of manifest.targets) {
+      const view = views.find((v) => v.targetId === target.id);
+      if (!view) {
+        continue;
+      }
+
+      const adapterName = `render${sanitizeSwiftIdentifier(view.typeName)}`;
+      const funcPattern = new RegExp(
+        `static func ${escapeRegExp(adapterName)}\\([^)]*\\)[^{]*\\{([\\s\\S]*?)\\n    \\}`,
+      );
+      const funcMatch = funcPattern.exec(adapterContent);
+      if (funcMatch && !funcMatch[1].includes("ContentUnavailableView")) {
+        target.status = "configured";
+      }
+    }
+
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  } catch { /* skip */ }
+}
+
 async function pickAppEntryCandidate(candidates: AppEntryCandidate[]): Promise<AppEntryCandidate | undefined> {
   if (candidates.length === 1) {
     return candidates[0];
@@ -892,7 +1222,7 @@ function scaffoldPreviewsIntoAppEntryFile(input: {
   productName: string;
   scheme: string;
   selectedViews: ViewCandidate[];
-}): void {
+}): string {
   let contents = readFileSync(input.appEntryPath, "utf8");
   contents = ensureSwiftImport(contents, "Foundation");
   contents = ensureSwiftImport(contents, "SwiftUI");
@@ -904,6 +1234,11 @@ function scaffoldPreviewsIntoAppEntryFile(input: {
   );
 
   writeFileSync(input.appEntryPath, contents, "utf8");
+
+  const adapterFilePath = path.join(path.dirname(input.appEntryPath), "SwiftUIExplorerPreviewAdapters.swift");
+  writeAdapterFile(adapterFilePath, input.selectedViews);
+
+  return adapterFilePath;
 }
 
 function writeStarterPreviewManifest(
@@ -1031,6 +1366,65 @@ function upsertSwiftUIExplorerGeneratedBlock(contents: string, generatedBlock: s
   return `${contents.trimEnd()}\n\n${generatedBlock}\n`;
 }
 
+function generateAdapterStub(view: ViewCandidate): string {
+  const adapterName = `render${sanitizeSwiftIdentifier(view.typeName)}`;
+
+  return [
+    `    // TODO: Replace the placeholder below with your real ${view.typeName} initializer.`,
+    `    //   Example: ${view.typeName}()`,
+    "    @ViewBuilder",
+    `    static func ${adapterName}(_ context: SwiftUIExplorerPreviewContext) -> some View {`,
+    "        ContentUnavailableView(",
+    `            ${toSwiftStringLiteral(view.displayName)},`,
+    '            systemImage: "puzzlepiece.extension",',
+    `            description: Text("Open SwiftUIExplorerPreviewAdapters.swift and replace this stub with a real ${view.typeName} initializer.")`,
+    "        )",
+    "    }",
+  ].join("\n");
+}
+
+function writeAdapterFile(adapterFilePath: string, selectedViews: ViewCandidate[]): void {
+  let existingContent = "";
+  if (existsSync(adapterFilePath)) {
+    existingContent = readFileSync(adapterFilePath, "utf8");
+  }
+
+  const newViews = selectedViews.filter((view) => {
+    const adapterName = `render${sanitizeSwiftIdentifier(view.typeName)}`;
+    return !existingContent.includes(`static func ${adapterName}(`);
+  });
+
+  if (newViews.length === 0 && existingContent) {
+    return;
+  }
+
+  if (!existingContent) {
+    const stubs = selectedViews.map((view) => generateAdapterStub(view)).join("\n\n");
+    const content = [
+      "// SwiftUIExplorerPreviewAdapters.swift",
+      "// Generated by SwiftUI Explorer. Edit adapter bodies to render your real views.",
+      "// New adapters are appended when re-running setup. Existing adapters are preserved.",
+      "",
+      "import SwiftUI",
+      "",
+      "enum SwiftUIExplorerPreviewAdapters {",
+      stubs,
+      "}",
+      "",
+    ].join("\n");
+    writeFileSync(adapterFilePath, content, "utf8");
+  } else {
+    const closingBraceIndex = existingContent.lastIndexOf("}");
+    if (closingBraceIndex === -1) {
+      return;
+    }
+
+    const newStubs = newViews.map((view) => generateAdapterStub(view)).join("\n\n");
+    const updated = `${existingContent.slice(0, closingBraceIndex)}\n${newStubs}\n}\n`;
+    writeFileSync(adapterFilePath, updated, "utf8");
+  }
+}
+
 function generateSwiftUIExplorerGeneratedBlock(appStructName: string, selectedViews: ViewCandidate[]): string {
   const targetLines = selectedViews.map((view) => {
     const adapterName = `render${sanitizeSwiftIdentifier(view.typeName)}`;
@@ -1044,23 +1438,6 @@ function generateSwiftUIExplorerGeneratedBlock(appStructName: string, selectedVi
       "            },",
     ].join("\n");
   }).join("\n");
-
-  const adapterLines = selectedViews.map((view) => {
-    const adapterName = `render${sanitizeSwiftIdentifier(view.typeName)}`;
-
-    return [
-      `    // TODO: Replace the placeholder below with your real ${view.typeName} initializer.`,
-      `    //   Example: ${view.typeName}()`,
-      "    @ViewBuilder",
-      `    static func ${adapterName}(_ context: SwiftUIExplorerPreviewContext) -> some View {`,
-      "        ContentUnavailableView(",
-      `            ${toSwiftStringLiteral(view.displayName)},`,
-      '            systemImage: "puzzlepiece.extension",',
-      `            description: Text("Open this file and replace this adapter stub with a real ${view.typeName} initializer.")`,
-      "        )",
-      "    }",
-    ].join("\n");
-  }).join("\n\n");
 
   return `// swiftui-explorer:begin
 // MARK: - SwiftUI Explorer Generated Preview Support
@@ -1079,7 +1456,7 @@ private extension ${appStructName} {
     }
 }
 
-private struct SwiftUIExplorerLaunchSelection {
+struct SwiftUIExplorerLaunchSelection {
     let targetID: String?
     let fixtureID: String?
     let environmentID: String?
@@ -1098,12 +1475,12 @@ private struct SwiftUIExplorerLaunchSelection {
     }
 }
 
-private struct SwiftUIExplorerPreviewFixture: Codable, Hashable, Identifiable {
+struct SwiftUIExplorerPreviewFixture: Codable, Hashable, Identifiable {
     let id: String
     let displayName: String
 }
 
-private struct SwiftUIExplorerPreviewEnvironment: Codable, Hashable, Identifiable {
+struct SwiftUIExplorerPreviewEnvironment: Codable, Hashable, Identifiable {
     enum ColorSchemeOption: String, Codable, Hashable {
         case light
         case dark
@@ -1168,7 +1545,7 @@ private struct SwiftUIExplorerPreviewEnvironment: Codable, Hashable, Identifiabl
     }
 }
 
-private struct SwiftUIExplorerPreviewDescriptor: Codable, Hashable {
+struct SwiftUIExplorerPreviewDescriptor: Codable, Hashable {
     let id: String
     let displayName: String
     let status: String
@@ -1176,18 +1553,18 @@ private struct SwiftUIExplorerPreviewDescriptor: Codable, Hashable {
     let supportedEnvironments: [SwiftUIExplorerPreviewEnvironment]
 }
 
-private struct SwiftUIExplorerPreviewManifest: Codable, Hashable {
+struct SwiftUIExplorerPreviewManifest: Codable, Hashable {
     let appName: String
     let scheme: String
     let targets: [SwiftUIExplorerPreviewDescriptor]
 }
 
-private struct SwiftUIExplorerPreviewContext {
+struct SwiftUIExplorerPreviewContext {
     let fixture: SwiftUIExplorerPreviewFixture?
     let environment: SwiftUIExplorerPreviewEnvironment
 }
 
-private struct SwiftUIExplorerPreviewTarget: Identifiable {
+struct SwiftUIExplorerPreviewTarget: Identifiable {
     let descriptor: SwiftUIExplorerPreviewDescriptor
     private let renderBody: @MainActor (SwiftUIExplorerPreviewContext) -> AnyView
 
@@ -1228,11 +1605,11 @@ private struct SwiftUIExplorerPreviewTarget: Identifiable {
     }
 }
 
-private protocol SwiftUIExplorerPreviewRegistryProtocol {
+protocol SwiftUIExplorerPreviewRegistryProtocol {
     func allPreviews() -> [SwiftUIExplorerPreviewTarget]
 }
 
-private extension SwiftUIExplorerPreviewRegistryProtocol {
+extension SwiftUIExplorerPreviewRegistryProtocol {
     func manifest(appName: String, scheme: String) -> SwiftUIExplorerPreviewManifest {
         SwiftUIExplorerPreviewManifest(
             appName: appName,
@@ -1242,7 +1619,7 @@ private extension SwiftUIExplorerPreviewRegistryProtocol {
     }
 }
 
-private struct SwiftUIExplorerPreviewRegistry: SwiftUIExplorerPreviewRegistryProtocol {
+struct SwiftUIExplorerPreviewRegistry: SwiftUIExplorerPreviewRegistryProtocol {
     func allPreviews() -> [SwiftUIExplorerPreviewTarget] {
         [
 ${targetLines}
@@ -1250,7 +1627,7 @@ ${targetLines}
     }
 }
 
-private enum SwiftUIExplorerPreviewBootstrap {
+enum SwiftUIExplorerPreviewBootstrap {
     static func writeManifestIfNeeded(
         registry: SwiftUIExplorerPreviewRegistry,
         appName: String,
@@ -1277,16 +1654,7 @@ private enum SwiftUIExplorerPreviewBootstrap {
     }
 }
 
-// MARK: - Preview Adapters
-// Each function below is a preview adapter stub. Replace the placeholder with your
-// real view initializer. The context parameter provides fixture and environment
-// selection so you can render different states of your view.
-
-private enum SwiftUIExplorerPreviewAdapters {
-${adapterLines}
-}
-
-private struct SwiftUIExplorerPreviewHostRootView: View {
+struct SwiftUIExplorerPreviewHostRootView: View {
     private let previews: [SwiftUIExplorerPreviewTarget]
 
     @State private var selectedPreviewID: String
@@ -1829,7 +2197,8 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
       <div class="buttonRow configHeader">
         <strong>Host App</strong>
         <div class="buttonRow">
-          <button id="setupButton">Generate Adapters</button>
+          <button id="aiGenerateButton">Generate With AI</button>
+          <button id="setupButton" class="secondary">Generate Stubs</button>
           <button id="configureButton" class="secondary">Configure Host App</button>
         </div>
       </div>
@@ -1896,9 +2265,9 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
     : `
       <div class="detailCard">
         <p>No preview targets are available yet.</p>
-        <p>Run setup to generate preview adapter stubs in your app entry file. Each adapter is a single function where you supply your real view initializer.</p>
+        <p>Generate adapter stubs first, then use AI to fill them in automatically.</p>
         <div class="buttonRow">
-          <button id="emptySetupButton">Generate Preview Adapters</button>
+          <button id="emptySetupButton">Generate Stubs</button>
         </div>
       </div>
     `;
@@ -1933,6 +2302,7 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
       const autoRefreshToggle = document.getElementById("autoRefreshToggle");
       const configureButton = document.getElementById("configureButton");
       const setupButton = document.getElementById("setupButton");
+      const aiGenerateButton = document.getElementById("aiGenerateButton");
       const emptySetupButton = document.getElementById("emptySetupButton");
       const autoRefreshStatus = document.getElementById("autoRefreshStatus");
       const panelStatus = document.getElementById("panelStatus");
@@ -2135,6 +2505,13 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
 
       setupButton && setupButton.addEventListener('click', triggerSetupPreviews);
       emptySetupButton && emptySetupButton.addEventListener('click', triggerSetupPreviews);
+
+      aiGenerateButton && aiGenerateButton.addEventListener('click', () => {
+        if (panelStatus) {
+          setStatus('pending', 'Generating adapters with AI...');
+        }
+        vscode.postMessage({ type: 'generateWithAI' });
+      });
 
       autoRefreshToggle && autoRefreshToggle.addEventListener('click', () => {
         const nextEnabled = !autoRefreshEnabled;
@@ -2358,6 +2735,7 @@ function isPanelMessage(
   | { type: "refreshPreview" }
   | { type: "configureHostApp" }
   | { type: "setupPreviews" }
+  | { type: "generateWithAI" }
   | { type: "toggleAutoRefresh"; enabled: boolean } {
   if (!value || typeof value !== "object" || !("type" in value)) {
     return false;
@@ -2373,6 +2751,10 @@ function isPanelMessage(
   }
 
   if (message.type === "setupPreviews") {
+    return true;
+  }
+
+  if (message.type === "generateWithAI") {
     return true;
   }
 
