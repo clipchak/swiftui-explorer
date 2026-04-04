@@ -17,7 +17,8 @@
     "onCommand:swiftuiExplorer.openPreview",
     "onCommand:swiftuiExplorer.refreshPreview",
     "onCommand:swiftuiExplorer.configureHostApp",
-    "onCommand:swiftuiExplorer.restartRuntime"
+    "onCommand:swiftuiExplorer.restartRuntime",
+    "onCommand:swiftuiExplorer.setupPreviews"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -45,6 +46,10 @@
       {
         "command": "swiftuiExplorer.restartRuntime",
         "title": "SwiftUI Explorer: Restart Runtime"
+      },
+      {
+        "command": "swiftuiExplorer.setupPreviews",
+        "title": "SwiftUI Explorer: Set Up Previews For This App"
       }
     ],
     "configuration": {

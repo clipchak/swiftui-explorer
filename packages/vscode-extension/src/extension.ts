@@ -1,5 +1,5 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import * as http from "node:http";
 import * as https from "node:https";
 import * as path from "node:path";
@@ -101,6 +101,26 @@ type ExplorerSnapshot = {
   autoRefresh: AutoRefreshState;
   hostAppConfiguration: HostAppConfiguration;
   selection: OpenPreviewRequest | null;
+};
+
+type SetupPreviewResult = {
+  hostApp: HostAppConfiguration;
+  appEntryFilePath: string;
+  targetCount: number;
+};
+
+type AppEntryCandidate = {
+  appName: string;
+  filePath: string;
+  relativePath: string;
+};
+
+type ViewCandidate = {
+  typeName: string;
+  displayName: string;
+  filePath: string;
+  relativePath: string;
+  targetId: string;
 };
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -207,6 +227,23 @@ export function activate(context: vscode.ExtensionContext): void {
         void offerRuntimeRestart(context, `Could not configure host app: ${message}`);
       }
     }),
+    vscode.commands.registerCommand("swiftuiExplorer.setupPreviews", async () => {
+      const baseUrl = getRuntimeBaseUrl();
+
+      try {
+        const result = await setupPreviewsForConfiguredHostApp(context, baseUrl);
+        if (!result) {
+          return;
+        }
+
+        vscode.window.showInformationMessage(
+          `Scaffolded ${result.targetCount} preview target${result.targetCount === 1 ? "" : "s"} in ${path.basename(result.appEntryFilePath)}.`,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown runtime error";
+        vscode.window.showErrorMessage(`Could not set up previews: ${message}`);
+      }
+    }),
     vscode.commands.registerCommand("swiftuiExplorer.openPanel", async () => {
       const panel = vscode.window.createWebviewPanel(
         "swiftuiExplorer",
@@ -279,6 +316,38 @@ export function activate(context: vscode.ExtensionContext): void {
                 text: `Could not configure host app: ${messageText}`,
               });
               void offerRuntimeRestart(context, `Could not configure host app: ${messageText}`);
+            }
+
+            return;
+          }
+
+          if (message.type === "setupPreviews") {
+            try {
+              const result = await setupPreviewsForConfiguredHostApp(context, baseUrl);
+              if (!result) {
+                panel.webview.postMessage({
+                  type: "previewStatus",
+                  kind: "success",
+                  text: "Preview setup canceled.",
+                });
+                return;
+              }
+
+              snapshot = await loadExplorerSnapshot(context, baseUrl);
+              panel.webview.html = renderPanelHtml(snapshot);
+              panel.webview.postMessage({
+                type: "previewStatus",
+                kind: "success",
+                text: `Scaffolded ${result.targetCount} preview target${result.targetCount === 1 ? "" : "s"}.`,
+              });
+            } catch (error) {
+              const messageText = error instanceof Error ? error.message : "Unknown runtime error";
+              panel.webview.postMessage({
+                type: "previewStatus",
+                kind: "error",
+                text: `Could not set up previews: ${messageText}`,
+              });
+              vscode.window.showErrorMessage(`Could not set up previews: ${messageText}`);
             }
 
             return;
@@ -611,6 +680,769 @@ async function promptForHostAppConfiguration(context: vscode.ExtensionContext, b
   );
 }
 
+async function setupPreviewsForConfiguredHostApp(
+  context: vscode.ExtensionContext,
+  baseUrl: string,
+): Promise<SetupPreviewResult | undefined> {
+  await ensureRuntimeReady(context);
+
+  const hostApp = await getJson<HostAppConfiguration>(`${baseUrl}/api/v1/config`);
+  const buildContainerPath = hostApp.workspacePath ?? hostApp.projectPath;
+  if (!buildContainerPath) {
+    throw new Error("Configure a host app project or workspace before setting up previews.");
+  }
+
+  const appEntryCandidates = await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: "Scanning for app entry files..." },
+    async () => findAppEntryCandidates(hostApp.appRoot),
+  );
+  if (appEntryCandidates.length === 0) {
+    throw new Error("Could not find an '@main ... : App' file in the configured host app.");
+  }
+
+  const selectedAppEntry = await pickAppEntryCandidate(appEntryCandidates);
+  if (!selectedAppEntry) {
+    return undefined;
+  }
+
+  const viewCandidates = await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: "Discovering SwiftUI views..." },
+    async () => findSwiftUIViewCandidates(hostApp.appRoot, selectedAppEntry.filePath),
+  );
+  if (viewCandidates.length === 0) {
+    throw new Error("No SwiftUI views were found to scaffold preview targets from.");
+  }
+
+  const selectedViews = await pickSetupPreviewCandidates(viewCandidates);
+  if (!selectedViews || selectedViews.length === 0) {
+    return undefined;
+  }
+
+  const productName = await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: "Reading app product name..." },
+    async () => detectBuildProductName(buildContainerPath, hostApp.scheme),
+  );
+
+  await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: "Scaffolding preview integration..." },
+    async () => {
+      scaffoldPreviewsIntoAppEntryFile({
+        appEntryPath: selectedAppEntry.filePath,
+        appStructName: selectedAppEntry.appName,
+        productName: normalizeProductName(productName ?? path.basename(hostApp.appRoot)),
+        scheme: hostApp.scheme,
+        selectedViews,
+      });
+    },
+  );
+
+  await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: "Writing starter preview manifest..." },
+    async () => {
+      writeStarterPreviewManifest(hostApp, normalizeProductName(productName ?? path.basename(hostApp.appRoot)), selectedViews);
+    },
+  );
+
+  return {
+    hostApp,
+    appEntryFilePath: selectedAppEntry.filePath,
+    targetCount: selectedViews.length,
+  };
+}
+
+async function pickAppEntryCandidate(candidates: AppEntryCandidate[]): Promise<AppEntryCandidate | undefined> {
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+
+  const selection = await vscode.window.showQuickPick(
+    candidates.map((candidate) => ({
+      label: candidate.appName,
+      description: candidate.relativePath,
+      candidate,
+    })),
+    {
+      title: "Select App Entry File",
+      ignoreFocusOut: true,
+      matchOnDescription: true,
+    },
+  );
+
+  return selection?.candidate;
+}
+
+async function pickSetupPreviewCandidates(candidates: ViewCandidate[]): Promise<ViewCandidate[] | undefined> {
+  const selection = await vscode.window.showQuickPick(
+    candidates.map((candidate) => ({
+      label: candidate.displayName,
+      description: candidate.relativePath,
+      detail: candidate.typeName,
+      candidate,
+    })),
+    {
+      title: "Select Views To Scaffold",
+      placeHolder: "Choose one or more SwiftUI views to expose as starter preview targets.",
+      canPickMany: true,
+      ignoreFocusOut: true,
+      matchOnDescription: true,
+      matchOnDetail: true,
+    },
+  );
+
+  return selection?.map((item) => item.candidate);
+}
+
+function findAppEntryCandidates(appRoot: string): AppEntryCandidate[] {
+  const candidates: AppEntryCandidate[] = [];
+
+  for (const filePath of walkSwiftFiles(appRoot)) {
+    const contents = readFileSync(filePath, "utf8");
+    const match = /@main[\s\S]*?struct\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*App\b/m.exec(contents);
+    if (!match) {
+      continue;
+    }
+
+    candidates.push({
+      appName: match[1],
+      filePath,
+      relativePath: path.relative(appRoot, filePath),
+    });
+  }
+
+  return candidates;
+}
+
+function findSwiftUIViewCandidates(appRoot: string, appEntryPath: string): ViewCandidate[] {
+  const candidates: ViewCandidate[] = [];
+  const seen = new Set<string>();
+
+  for (const filePath of walkSwiftFiles(appRoot)) {
+    if (filePath === appEntryPath) {
+      continue;
+    }
+
+    const contents = readFileSync(filePath, "utf8");
+    if (contents.includes("swiftui-explorer:begin")) {
+      continue;
+    }
+
+    for (const match of contents.matchAll(/struct\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*View\b/g)) {
+      const typeName = match[1];
+      if (typeName.startsWith("SwiftUIExplorer")) {
+        continue;
+      }
+
+      const key = `${filePath}:${typeName}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+
+      candidates.push({
+        typeName,
+        displayName: humanizeIdentifier(typeName),
+        filePath,
+        relativePath: path.relative(appRoot, filePath),
+        targetId: slugifyIdentifier(typeName),
+      });
+    }
+  }
+
+  return candidates.sort((left, right) => left.displayName.localeCompare(right.displayName));
+}
+
+function walkSwiftFiles(root: string): string[] {
+  const results: string[] = [];
+  const ignoredDirectories = new Set([
+    ".git",
+    ".build",
+    ".swiftpm",
+    "DerivedData",
+    "Pods",
+    "Carthage",
+    "node_modules",
+  ]);
+
+  const visit = (currentPath: string): void => {
+    for (const entry of readdirSync(currentPath, { withFileTypes: true })) {
+      if (ignoredDirectories.has(entry.name) || entry.name.endsWith(".xcodeproj") || entry.name.endsWith(".xcworkspace")) {
+        continue;
+      }
+
+      const absolutePath = path.join(currentPath, entry.name);
+      if (entry.isDirectory()) {
+        visit(absolutePath);
+        continue;
+      }
+
+      if (entry.isFile() && absolutePath.endsWith(".swift")) {
+        results.push(absolutePath);
+      }
+    }
+  };
+
+  visit(root);
+  return results;
+}
+
+function scaffoldPreviewsIntoAppEntryFile(input: {
+  appEntryPath: string;
+  appStructName: string;
+  productName: string;
+  scheme: string;
+  selectedViews: ViewCandidate[];
+}): void {
+  let contents = readFileSync(input.appEntryPath, "utf8");
+  contents = ensureSwiftImport(contents, "Foundation");
+  contents = ensureSwiftImport(contents, "SwiftUI");
+  contents = ensureSwiftUIExplorerStoredProperties(contents, input.productName, input.scheme);
+  contents = ensureSwiftUIExplorerWindowGroupWrapper(contents);
+  contents = upsertSwiftUIExplorerGeneratedBlock(
+    contents,
+    generateSwiftUIExplorerGeneratedBlock(input.appStructName, input.selectedViews),
+  );
+
+  writeFileSync(input.appEntryPath, contents, "utf8");
+}
+
+function writeStarterPreviewManifest(
+  hostApp: HostAppConfiguration,
+  appName: string,
+  selectedViews: ViewCandidate[],
+): void {
+  const manifest = {
+    appName,
+    scheme: hostApp.scheme,
+    targets: selectedViews.map((view) => ({
+      id: view.targetId,
+      displayName: view.displayName,
+      fixtures: [],
+      supportedEnvironments: [
+        {
+          id: "light",
+          displayName: "Light",
+          colorScheme: "light",
+          localeIdentifier: "en_US",
+          dynamicTypeSize: "large",
+        },
+        {
+          id: "dark",
+          displayName: "Dark",
+          colorScheme: "dark",
+          localeIdentifier: "en_US",
+          dynamicTypeSize: "large",
+        },
+      ],
+    })),
+  };
+
+  mkdirSync(path.dirname(hostApp.manifestPath), {
+    recursive: true,
+  });
+  writeFileSync(`${hostApp.manifestPath}`, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+}
+
+function ensureSwiftImport(contents: string, moduleName: string): string {
+  if (new RegExp(`^import\\s+${escapeRegExp(moduleName)}\\s*$`, "m").test(contents)) {
+    return contents;
+  }
+
+  const firstImportMatch = /^import\s+\w+/m.exec(contents);
+  if (!firstImportMatch || firstImportMatch.index === undefined) {
+    return `import ${moduleName}\n${contents}`;
+  }
+
+  return `${contents.slice(0, firstImportMatch.index)}import ${moduleName}\n${contents.slice(firstImportMatch.index)}`;
+}
+
+function ensureSwiftUIExplorerStoredProperties(contents: string, productName: string, scheme: string): string {
+  if (contents.includes("swiftUIExplorerLaunchSelection = SwiftUIExplorerLaunchSelection.fromProcessEnvironment()")) {
+    return contents;
+  }
+
+  const appStructMatch = /@main[\s\S]*?struct\s+[A-Za-z_][A-Za-z0-9_]*\s*:\s*App\s*\{/.exec(contents);
+  if (!appStructMatch || appStructMatch.index === undefined) {
+    throw new Error("Could not find the app struct to inject preview state into.");
+  }
+
+  const insertionIndex = appStructMatch.index + appStructMatch[0].length;
+  const snippet = `
+
+    private let swiftUIExplorerLaunchSelection = SwiftUIExplorerLaunchSelection.fromProcessEnvironment()
+    private let swiftUIExplorerPreviewRegistry = SwiftUIExplorerPreviewRegistry()
+    private let swiftUIExplorerManifestBootstrapped = SwiftUIExplorerPreviewBootstrap.writeManifestIfNeeded(
+        registry: SwiftUIExplorerPreviewRegistry(),
+        appName: ${toSwiftStringLiteral(productName)},
+        scheme: ${toSwiftStringLiteral(scheme)}
+    )
+`;
+
+  return `${contents.slice(0, insertionIndex)}${snippet}${contents.slice(insertionIndex)}`;
+}
+
+function ensureSwiftUIExplorerWindowGroupWrapper(contents: string): string {
+  if (contents.includes("swiftUIExplorerRoot {")) {
+    return contents;
+  }
+
+  const appStructMatch = /@main[\s\S]*?struct\s+[A-Za-z_][A-Za-z0-9_]*\s*:\s*App\s*\{/.exec(contents);
+  if (!appStructMatch || appStructMatch.index === undefined) {
+    throw new Error("Could not find the app struct for preview wrapping.");
+  }
+
+  const structOpenBraceIndex = appStructMatch.index + appStructMatch[0].length - 1;
+  const structCloseBraceIndex = findMatchingBrace(contents, structOpenBraceIndex);
+  const structBody = contents.slice(structOpenBraceIndex + 1, structCloseBraceIndex);
+  const windowGroupMatch = /WindowGroup\b/.exec(structBody);
+  if (!windowGroupMatch || windowGroupMatch.index === undefined) {
+    throw new Error("Could not find a WindowGroup in the app body to wrap.");
+  }
+
+  const windowGroupIndex = structOpenBraceIndex + 1 + windowGroupMatch.index;
+  const windowGroupBraceIndex = contents.indexOf("{", windowGroupIndex);
+  if (windowGroupBraceIndex === -1) {
+    throw new Error("Could not parse the WindowGroup body.");
+  }
+
+  const windowGroupCloseBraceIndex = findMatchingBrace(contents, windowGroupBraceIndex);
+  const lineStartIndex = contents.lastIndexOf("\n", windowGroupIndex) + 1;
+  const baseIndent = contents.slice(lineStartIndex, windowGroupIndex).match(/^\s*/)?.[0] ?? "";
+  const wrapperIndent = `${baseIndent}    `;
+  const contentIndent = `${wrapperIndent}    `;
+  const originalInner = contents.slice(windowGroupBraceIndex + 1, windowGroupCloseBraceIndex).trim();
+  const replacement = `WindowGroup {\n${wrapperIndent}swiftUIExplorerRoot {\n${indentMultiline(originalInner, contentIndent)}\n${wrapperIndent}}\n${baseIndent}}`;
+
+  return `${contents.slice(0, windowGroupIndex)}${replacement}${contents.slice(windowGroupCloseBraceIndex + 1)}`;
+}
+
+function upsertSwiftUIExplorerGeneratedBlock(contents: string, generatedBlock: string): string {
+  const beginMarker = "// swiftui-explorer:begin";
+  const endMarker = "// swiftui-explorer:end";
+  const beginIndex = contents.indexOf(beginMarker);
+  const endIndex = contents.indexOf(endMarker);
+
+  if (beginIndex !== -1 && endIndex !== -1 && endIndex > beginIndex) {
+    const replaceEnd = endIndex + endMarker.length;
+    return `${contents.slice(0, beginIndex)}${generatedBlock}${contents.slice(replaceEnd)}`;
+  }
+
+  return `${contents.trimEnd()}\n\n${generatedBlock}\n`;
+}
+
+function generateSwiftUIExplorerGeneratedBlock(appStructName: string, selectedViews: ViewCandidate[]): string {
+  const targetLines = selectedViews.map((view) => {
+    const rendererName = `render${sanitizeSwiftIdentifier(view.typeName)}`;
+
+    return [
+      "            SwiftUIExplorerPreviewTarget(",
+      `                id: ${toSwiftStringLiteral(view.targetId)},`,
+      `                displayName: ${toSwiftStringLiteral(view.displayName)}`,
+      "            ) { _ in",
+      `                SwiftUIExplorerGeneratedPreviewRenderer.${rendererName}()`,
+      "            },",
+    ].join("\n");
+  }).join("\n");
+
+  const rendererLines = selectedViews.map((view) => {
+    const rendererName = `render${sanitizeSwiftIdentifier(view.typeName)}`;
+
+    return [
+      "    @ViewBuilder",
+      `    static func ${rendererName}() -> some View {`,
+      "        ContentUnavailableView(",
+      `            ${toSwiftStringLiteral(`Connect ${view.displayName}`)},`,
+      '            systemImage: "wand.and.stars",',
+      `            description: Text(${toSwiftStringLiteral(`Replace this placeholder with a real ${view.typeName} initializer.`)})`,
+      "        )",
+      "    }",
+    ].join("\n");
+  }).join("\n\n");
+
+  return `// swiftui-explorer:begin
+// MARK: - SwiftUI Explorer Generated Preview Support
+
+private extension ${appStructName} {
+    @ViewBuilder
+    func swiftUIExplorerRoot<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        if swiftUIExplorerLaunchSelection.isActive {
+            SwiftUIExplorerPreviewHostRootView(
+                registry: swiftUIExplorerPreviewRegistry,
+                launchSelection: swiftUIExplorerLaunchSelection
+            )
+        } else {
+            content()
+        }
+    }
+}
+
+private struct SwiftUIExplorerLaunchSelection {
+    let targetID: String?
+    let fixtureID: String?
+    let environmentID: String?
+
+    var isActive: Bool {
+        targetID != nil || ProcessInfo.processInfo.environment["SWIFTUI_EXPLORER_MANIFEST_OUTPUT"] != nil
+    }
+
+    static func fromProcessEnvironment() -> SwiftUIExplorerLaunchSelection {
+        let environment = ProcessInfo.processInfo.environment
+        return SwiftUIExplorerLaunchSelection(
+            targetID: environment["SWIFTUI_EXPLORER_TARGET_ID"],
+            fixtureID: environment["SWIFTUI_EXPLORER_FIXTURE_ID"],
+            environmentID: environment["SWIFTUI_EXPLORER_ENVIRONMENT_ID"]
+        )
+    }
+}
+
+private struct SwiftUIExplorerPreviewFixture: Codable, Hashable, Identifiable {
+    let id: String
+    let displayName: String
+}
+
+private struct SwiftUIExplorerPreviewEnvironment: Codable, Hashable, Identifiable {
+    enum ColorSchemeOption: String, Codable, Hashable {
+        case light
+        case dark
+    }
+
+    enum DynamicTypeSizeOption: String, Codable, Hashable {
+        case small
+        case large
+        case accessibility1
+    }
+
+    let id: String
+    let displayName: String
+    let colorScheme: ColorSchemeOption
+    let localeIdentifier: String
+    let dynamicTypeSize: DynamicTypeSizeOption
+
+    static let defaultLight = SwiftUIExplorerPreviewEnvironment(
+        id: "light",
+        displayName: "Light",
+        colorScheme: .light,
+        localeIdentifier: "en_US",
+        dynamicTypeSize: .large
+    )
+
+    static let defaultDark = SwiftUIExplorerPreviewEnvironment(
+        id: "dark",
+        displayName: "Dark",
+        colorScheme: .dark,
+        localeIdentifier: "en_US",
+        dynamicTypeSize: .large
+    )
+
+    static let defaults = [defaultLight, defaultDark]
+
+    @MainActor
+    func apply<Content: View>(to content: Content) -> some View {
+        content
+            .environment(\\.locale, Locale(identifier: localeIdentifier))
+            .environment(\\.dynamicTypeSize, swiftUIDynamicTypeSize)
+            .preferredColorScheme(swiftUIColorScheme)
+    }
+
+    private var swiftUIColorScheme: SwiftUI.ColorScheme {
+        switch colorScheme {
+        case .light:
+            return .light
+        case .dark:
+            return .dark
+        }
+    }
+
+    private var swiftUIDynamicTypeSize: SwiftUI.DynamicTypeSize {
+        switch dynamicTypeSize {
+        case .small:
+            return .small
+        case .large:
+            return .large
+        case .accessibility1:
+            return .accessibility1
+        }
+    }
+}
+
+private struct SwiftUIExplorerPreviewDescriptor: Codable, Hashable {
+    let id: String
+    let displayName: String
+    let fixtures: [SwiftUIExplorerPreviewFixture]
+    let supportedEnvironments: [SwiftUIExplorerPreviewEnvironment]
+}
+
+private struct SwiftUIExplorerPreviewManifest: Codable, Hashable {
+    let appName: String
+    let scheme: String
+    let targets: [SwiftUIExplorerPreviewDescriptor]
+}
+
+private struct SwiftUIExplorerPreviewContext {
+    let fixture: SwiftUIExplorerPreviewFixture?
+    let environment: SwiftUIExplorerPreviewEnvironment
+}
+
+private struct SwiftUIExplorerPreviewTarget: Identifiable {
+    let descriptor: SwiftUIExplorerPreviewDescriptor
+    private let renderBody: @MainActor (SwiftUIExplorerPreviewContext) -> AnyView
+
+    var id: String {
+        descriptor.id
+    }
+
+    init<Content: View>(
+        id: String,
+        displayName: String,
+        fixtures: [SwiftUIExplorerPreviewFixture] = [],
+        supportedEnvironments: [SwiftUIExplorerPreviewEnvironment] = SwiftUIExplorerPreviewEnvironment.defaults,
+        @ViewBuilder render: @escaping @MainActor (SwiftUIExplorerPreviewContext) -> Content
+    ) {
+        self.descriptor = SwiftUIExplorerPreviewDescriptor(
+            id: id,
+            displayName: displayName,
+            fixtures: fixtures,
+            supportedEnvironments: supportedEnvironments
+        )
+        self.renderBody = { context in
+            AnyView(render(context))
+        }
+    }
+
+    @MainActor
+    func makeView(
+        fixtureID: String? = nil,
+        environment: SwiftUIExplorerPreviewEnvironment? = nil
+    ) -> some View {
+        let selectedEnvironment = environment ?? descriptor.supportedEnvironments.first ?? .defaultLight
+        let selectedFixture = descriptor.fixtures.first { $0.id == fixtureID } ?? descriptor.fixtures.first
+        let context = SwiftUIExplorerPreviewContext(fixture: selectedFixture, environment: selectedEnvironment)
+
+        return selectedEnvironment.apply(to: renderBody(context))
+    }
+}
+
+private protocol SwiftUIExplorerPreviewRegistryProtocol {
+    func allPreviews() -> [SwiftUIExplorerPreviewTarget]
+}
+
+private extension SwiftUIExplorerPreviewRegistryProtocol {
+    func manifest(appName: String, scheme: String) -> SwiftUIExplorerPreviewManifest {
+        SwiftUIExplorerPreviewManifest(
+            appName: appName,
+            scheme: scheme,
+            targets: allPreviews().map(\\.descriptor)
+        )
+    }
+}
+
+private struct SwiftUIExplorerPreviewRegistry: SwiftUIExplorerPreviewRegistryProtocol {
+    func allPreviews() -> [SwiftUIExplorerPreviewTarget] {
+        [
+${targetLines}
+        ]
+    }
+}
+
+private enum SwiftUIExplorerPreviewBootstrap {
+    static func writeManifestIfNeeded(
+        registry: SwiftUIExplorerPreviewRegistry,
+        appName: String,
+        scheme: String
+    ) -> Bool {
+        guard let outputPath = ProcessInfo.processInfo.environment["SWIFTUI_EXPLORER_MANIFEST_OUTPUT"] else {
+            return false
+        }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+
+        guard let data = try? encoder.encode(registry.manifest(appName: appName, scheme: scheme)) else {
+            return false
+        }
+
+        let url = URL(fileURLWithPath: outputPath)
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? data.write(to: url)
+        return true
+    }
+}
+
+private enum SwiftUIExplorerGeneratedPreviewRenderer {
+${rendererLines}
+}
+
+private struct SwiftUIExplorerPreviewHostRootView: View {
+    private let previews: [SwiftUIExplorerPreviewTarget]
+
+    @State private var selectedPreviewID: String
+    @State private var selectedFixtureID: String
+    @State private var selectedEnvironmentID: String
+
+    init(
+        registry: some SwiftUIExplorerPreviewRegistryProtocol,
+        launchSelection: SwiftUIExplorerLaunchSelection
+    ) {
+        let previews = registry.allPreviews()
+        self.previews = previews
+
+        let initialPreview = previews.first(where: { $0.id == launchSelection.targetID }) ?? previews.first
+        let initialFixtureID = initialPreview?.descriptor.fixtures.first(where: { $0.id == launchSelection.fixtureID })?.id
+            ?? initialPreview?.descriptor.fixtures.first?.id
+            ?? ""
+        let initialEnvironmentID = initialPreview?.descriptor.supportedEnvironments.first(where: { $0.id == launchSelection.environmentID })?.id
+            ?? initialPreview?.descriptor.supportedEnvironments.first?.id
+            ?? SwiftUIExplorerPreviewEnvironment.defaultLight.id
+
+        _selectedPreviewID = State(initialValue: initialPreview?.descriptor.id ?? "")
+        _selectedFixtureID = State(initialValue: initialFixtureID)
+        _selectedEnvironmentID = State(initialValue: initialEnvironmentID)
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 16) {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("SwiftUI Explorer")
+                        .font(.headline)
+
+                    Picker("Target", selection: $selectedPreviewID) {
+                        ForEach(previews) { preview in
+                            Text(preview.descriptor.displayName).tag(preview.id)
+                        }
+                    }
+                    .pickerStyle(.menu)
+
+                    if let preview = selectedPreview, !preview.descriptor.fixtures.isEmpty {
+                        Picker("Fixture", selection: $selectedFixtureID) {
+                            ForEach(preview.descriptor.fixtures) { fixture in
+                                Text(fixture.displayName).tag(fixture.id)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                    }
+
+                    if let preview = selectedPreview {
+                        Picker("Environment", selection: $selectedEnvironmentID) {
+                            ForEach(preview.descriptor.supportedEnvironments) { environment in
+                                Text(environment.displayName).tag(environment.id)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                Divider()
+
+                if let preview = selectedPreview {
+                    ScrollView {
+                        preview.makeView(
+                            fixtureID: selectedFixtureID.isEmpty ? nil : selectedFixtureID,
+                            environment: selectedEnvironment
+                        )
+                        .padding(.vertical, 24)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                } else {
+                    ContentUnavailableView(
+                        "No Preview Targets",
+                        systemImage: "rectangle.on.rectangle.slash",
+                        description: Text("Run the setup command again to regenerate starter previews.")
+                    )
+                }
+            }
+            .padding()
+            .navigationTitle("SwiftUI Explorer")
+            .onChange(of: selectedPreviewID) { _, _ in
+                syncSelectionToCurrentPreview()
+            }
+        }
+    }
+
+    private var selectedPreview: SwiftUIExplorerPreviewTarget? {
+        previews.first { $0.id == selectedPreviewID }
+    }
+
+    private var selectedEnvironment: SwiftUIExplorerPreviewEnvironment {
+        selectedPreview?.descriptor.supportedEnvironments.first(where: { $0.id == selectedEnvironmentID })
+            ?? selectedPreview?.descriptor.supportedEnvironments.first
+            ?? .defaultLight
+    }
+
+    private func syncSelectionToCurrentPreview() {
+        guard let preview = selectedPreview else {
+            selectedFixtureID = ""
+            selectedEnvironmentID = SwiftUIExplorerPreviewEnvironment.defaultLight.id
+            return
+        }
+
+        selectedFixtureID = preview.descriptor.fixtures.first?.id ?? ""
+        selectedEnvironmentID = preview.descriptor.supportedEnvironments.first?.id ?? SwiftUIExplorerPreviewEnvironment.defaultLight.id
+    }
+}
+// swiftui-explorer:end`;
+}
+
+function findMatchingBrace(contents: string, openingBraceIndex: number): number {
+  let depth = 0;
+
+  for (let index = openingBraceIndex; index < contents.length; index += 1) {
+    const character = contents[index];
+    if (character === "{") {
+      depth += 1;
+    } else if (character === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+    }
+  }
+
+  throw new Error("Could not match braces in the selected Swift file.");
+}
+
+function indentMultiline(value: string, prefix: string): string {
+  return value
+    .split("\n")
+    .map((line) => `${prefix}${line}`)
+    .join("\n");
+}
+
+function humanizeIdentifier(value: string): string {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function slugifyIdentifier(value: string): string {
+  return humanizeIdentifier(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function sanitizeSwiftIdentifier(value: string): string {
+  const sanitized = value.replace(/[^A-Za-z0-9_]/g, "");
+  return sanitized.length > 0 ? sanitized[0].toUpperCase() + sanitized.slice(1) : "View";
+}
+
+function normalizeProductName(value: string): string {
+  return value.endsWith(".app") ? value.slice(0, -4) : value;
+}
+
+function toSwiftStringLiteral(value: string): string {
+  return JSON.stringify(value);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 async function detectAndPickBuildContainer(appRoot: string): Promise<string | undefined> {
   const entries = readdirSync(appRoot, { withFileTypes: true });
   const candidates = entries
@@ -694,6 +1526,23 @@ async function detectAndPickScheme(buildContainerPath: string): Promise<string |
 }
 
 async function detectBundleIdentifier(buildContainerPath: string, scheme: string): Promise<string | null> {
+  return detectBuildSetting(buildContainerPath, scheme, "PRODUCT_BUNDLE_IDENTIFIER");
+}
+
+async function detectBuildProductName(buildContainerPath: string, scheme: string): Promise<string | null> {
+  const fullProductName = await detectBuildSetting(buildContainerPath, scheme, "FULL_PRODUCT_NAME");
+  if (fullProductName) {
+    return normalizeProductName(fullProductName);
+  }
+
+  return detectBuildSetting(buildContainerPath, scheme, "PRODUCT_NAME");
+}
+
+async function detectBuildSetting(
+  buildContainerPath: string,
+  scheme: string,
+  settingKey: string,
+): Promise<string | null> {
   const isWorkspace = buildContainerPath.endsWith(".xcworkspace");
   const flag = isWorkspace ? "-workspace" : "-project";
 
@@ -705,7 +1554,7 @@ async function detectBundleIdentifier(buildContainerPath: string, scheme: string
     );
 
     for (const line of stdout.split("\n")) {
-      const match = line.match(/^\s*PRODUCT_BUNDLE_IDENTIFIER\s*=\s*(.+)$/);
+      const match = line.match(new RegExp(`^\\s*${escapeRegExp(settingKey)}\\s*=\\s*(.+)$`));
       if (match) {
         return match[1].trim();
       }
@@ -967,7 +1816,10 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
     <div class="detailCard">
       <div class="buttonRow configHeader">
         <strong>Host App</strong>
-        <button id="configureButton" class="secondary">Configure Host App</button>
+        <div class="buttonRow">
+          <button id="setupButton">Set Up Previews</button>
+          <button id="configureButton" class="secondary">Configure Host App</button>
+        </div>
       </div>
       <p>Mode: <strong>${hostAppConfiguration.usingDefault ? "Sample app" : "Custom app"}</strong></p>
       <p>Root: <code>${escapeHtml(hostAppConfiguration.appRoot)}</code></p>
@@ -1023,7 +1875,13 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
       <div id="targetDetails"></div>
     `
     : `
-      <p>No preview targets are available yet.</p>
+      <div class="detailCard">
+        <p>No preview targets are available yet.</p>
+        <p>Run setup to scaffold starter preview targets into the configured app entry file.</p>
+        <div class="buttonRow">
+          <button id="emptySetupButton">Set Up Previews For This App</button>
+        </div>
+      </div>
     `;
 
   return renderShell(`
@@ -1055,6 +1913,8 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
       const refreshButton = document.getElementById("refreshButton");
       const autoRefreshToggle = document.getElementById("autoRefreshToggle");
       const configureButton = document.getElementById("configureButton");
+      const setupButton = document.getElementById("setupButton");
+      const emptySetupButton = document.getElementById("emptySetupButton");
       const autoRefreshStatus = document.getElementById("autoRefreshStatus");
       const panelStatus = document.getElementById("panelStatus");
       const targetDetails = document.getElementById("targetDetails");
@@ -1233,6 +2093,18 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
           type: 'configureHostApp',
         });
       });
+
+      function triggerSetupPreviews() {
+        if (panelStatus) {
+          setStatus('pending', 'Scaffolding preview integration...');
+        }
+        vscode.postMessage({
+          type: 'setupPreviews',
+        });
+      }
+
+      setupButton && setupButton.addEventListener('click', triggerSetupPreviews);
+      emptySetupButton && emptySetupButton.addEventListener('click', triggerSetupPreviews);
 
       autoRefreshToggle && autoRefreshToggle.addEventListener('click', () => {
         const nextEnabled = !autoRefreshEnabled;
@@ -1427,6 +2299,7 @@ function isPanelMessage(
   | { type: "openPreview"; payload: OpenPreviewRequest }
   | { type: "refreshPreview" }
   | { type: "configureHostApp" }
+  | { type: "setupPreviews" }
   | { type: "toggleAutoRefresh"; enabled: boolean } {
   if (!value || typeof value !== "object" || !("type" in value)) {
     return false;
@@ -1438,6 +2311,10 @@ function isPanelMessage(
   }
 
   if (message.type === "configureHostApp") {
+    return true;
+  }
+
+  if (message.type === "setupPreviews") {
     return true;
   }
 

@@ -413,7 +413,7 @@ async function openPreview(
 
   await ensureSimulatorBooted(simulator.udid);
   await focusSimulatorApp(simulator.udid);
-  const appPath = await buildHostApp(hostApp, root, hostApp.scheme, simulator.udid, manifest.appName);
+  const appPath = await buildHostApp(hostApp, root, hostApp.scheme, simulator.udid);
   const manifestOutputPath = getManifestCachePath(root, hostApp.scheme);
   await installAndLaunchHostApp(hostApp.bundleIdentifier, appPath, simulator.udid, {
     targetId: target.id,
@@ -875,7 +875,6 @@ async function buildHostApp(
   root: string,
   scheme: string,
   simulatorId: string,
-  appName: string,
 ): Promise<string> {
   mkdirSync(hostApp.derivedDataPath, {
     recursive: true,
@@ -905,12 +904,39 @@ async function buildHostApp(
     root,
   );
 
-  const appPath = path.join(hostApp.derivedDataPath, "Build", "Products", "Debug-iphonesimulator", `${appName}.app`);
+  const buildSettingsOutput = await runCommand(
+    "xcodebuild",
+    [
+      ...buildTargetArgs,
+      "-scheme",
+      scheme,
+      "-destination",
+      `id=${simulatorId}`,
+      "-derivedDataPath",
+      hostApp.derivedDataPath,
+      "-showBuildSettings",
+    ],
+    root,
+  );
+
+  const targetBuildDir = parseBuildSetting(buildSettingsOutput.stdout, "TARGET_BUILD_DIR");
+  const fullProductName = parseBuildSetting(buildSettingsOutput.stdout, "FULL_PRODUCT_NAME");
+
+  if (!targetBuildDir || !fullProductName) {
+    throw new HttpError(500, "Could not determine the built app path from Xcode build settings.");
+  }
+
+  const appPath = path.join(targetBuildDir, fullProductName);
   if (!existsSync(appPath)) {
     throw new HttpError(500, `Built app not found at '${appPath}'.`);
   }
 
   return appPath;
+}
+
+function parseBuildSetting(output: string, key: string): string | null {
+  const match = output.match(new RegExp(`^\\s*${key}\\s*=\\s*(.+)$`, "m"));
+  return match ? match[1].trim() : null;
 }
 
 async function installAndLaunchHostApp(

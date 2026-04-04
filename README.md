@@ -38,10 +38,11 @@ swift test
 
 ## Integrating a Host App
 
-1. Add `SwiftPreviewKit` as a dependency to your app.
-2. Create a `PreviewRegistry` that defines your preview targets inline (see `SamplePreviewRegistry`).
-3. In your app's `init()`, generate and write the manifest using `PreviewRegistry.manifest(appName:scheme:)` when `SWIFTUI_EXPLORER_MANIFEST_OUTPUT` is set.
-4. Use `Configure Host App` in the explorer panel — you only need to provide the app root, project/workspace, scheme, and bundle ID. The manifest is discovered automatically.
+1. Use `Configure Host App` in the explorer panel — you only need to provide the app root, project/workspace, scheme, and bundle ID.
+2. If your app has no preview targets yet, run `SwiftUI Explorer: Set Up Previews For This App` or use the panel button. The extension scans for SwiftUI views and scaffolds starter preview support directly into your `@main ... : App` file.
+3. Open the generated placeholder targets in Simulator to confirm the integration is working.
+4. Replace the generated placeholder renderers with real view initializers and fixtures as you refine the integration.
+5. If you want a cleaner long-term setup, you can later move the generated support into a dedicated SwiftPreviewKit-based registry similar to the sample app.
 
 ## MVP Direction
 
