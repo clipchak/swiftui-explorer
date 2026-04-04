@@ -36,6 +36,7 @@ type PreviewEnvironment = {
 type PreviewDescriptor = {
   id: string;
   displayName: string;
+  status?: "placeholder" | "configured";
   fixtures: PreviewFixture[];
   supportedEnvironments: PreviewEnvironment[];
 };

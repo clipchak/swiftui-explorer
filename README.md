@@ -38,11 +38,25 @@ swift test
 
 ## Integrating a Host App
 
-1. Use `Configure Host App` in the explorer panel — you only need to provide the app root, project/workspace, scheme, and bundle ID.
-2. If your app has no preview targets yet, run `SwiftUI Explorer: Set Up Previews For This App` or use the panel button. The extension scans for SwiftUI views and scaffolds starter preview support directly into your `@main ... : App` file.
-3. Open the generated placeholder targets in Simulator to confirm the integration is working.
-4. Replace the generated placeholder renderers with real view initializers and fixtures as you refine the integration.
-5. If you want a cleaner long-term setup, you can later move the generated support into a dedicated SwiftPreviewKit-based registry similar to the sample app.
+1. **Configure** — Use `Configure Host App` in the explorer panel. Provide the app root, project/workspace, scheme, and bundle ID.
+2. **Generate adapters** — Run `SwiftUI Explorer: Generate Preview Adapters` (or click "Set Up Previews" in the panel). The extension scans your project for SwiftUI views and generates preview adapter stubs into your `@main ... : App` file.
+3. **Verify** — Open any generated target in Simulator. You'll see a placeholder confirming the wiring works.
+4. **Fill in adapters** — Each adapter is a static function in `SwiftUIExplorerPreviewAdapters`. Replace the `ContentUnavailableView` placeholder with your real view initializer:
+
+```swift
+// Before (generated stub):
+static func renderSettingsView(_ context: SwiftUIExplorerPreviewContext) -> some View {
+    ContentUnavailableView("Settings View", systemImage: "puzzlepiece.extension", ...)
+}
+
+// After (your real view):
+static func renderSettingsView(_ context: SwiftUIExplorerPreviewContext) -> some View {
+    SettingsView(store: SettingsStore.preview)
+}
+```
+
+5. **Update status** — Mark the target's status as `"configured"` in the manifest (`.swiftui-explorer/manifests/<scheme>.json`) to remove the stub badge in the panel.
+6. **Advanced** — For a cleaner long-term setup, move adapters into a dedicated SwiftPreviewKit-based registry similar to the sample app in `examples/sample-swiftui-app`.
 
 ## MVP Direction
 

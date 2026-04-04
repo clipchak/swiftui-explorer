@@ -49,7 +49,7 @@
       },
       {
         "command": "swiftuiExplorer.setupPreviews",
-        "title": "SwiftUI Explorer: Set Up Previews For This App"
+        "title": "SwiftUI Explorer: Generate Preview Adapters"
       }
     ],
     "configuration": {

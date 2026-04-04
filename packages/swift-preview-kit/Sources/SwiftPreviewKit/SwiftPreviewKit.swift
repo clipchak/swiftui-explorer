@@ -89,17 +89,20 @@ public struct PreviewEnvironment: Codable, Hashable, Sendable, Identifiable {
 public struct PreviewDescriptor: Codable, Hashable, Sendable {
     public let id: String
     public let displayName: String
+    public let status: String
     public let fixtures: [PreviewFixture]
     public let supportedEnvironments: [PreviewEnvironment]
 
     public init(
         id: String,
         displayName: String,
+        status: String = "configured",
         fixtures: [PreviewFixture] = [],
         supportedEnvironments: [PreviewEnvironment] = PreviewEnvironment.defaults
     ) {
         self.id = id
         self.displayName = displayName
+        self.status = status
         self.fixtures = fixtures
         self.supportedEnvironments = supportedEnvironments
     }
@@ -138,6 +141,7 @@ public struct PreviewTarget: Identifiable {
     public init<Content: View>(
         id: String,
         displayName: String,
+        status: String = "configured",
         fixtures: [PreviewFixture] = [],
         supportedEnvironments: [PreviewEnvironment] = PreviewEnvironment.defaults,
         @ViewBuilder render: @escaping @MainActor (PreviewContext) -> Content
@@ -145,6 +149,7 @@ public struct PreviewTarget: Identifiable {
         self.descriptor = PreviewDescriptor(
             id: id,
             displayName: displayName,
+            status: status,
             fixtures: fixtures,
             supportedEnvironments: supportedEnvironments
         )

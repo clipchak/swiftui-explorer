@@ -38,6 +38,33 @@ Returns the runtime's view of the current workspace:
 }
 ```
 
+### `GET /api/v1/targets`
+
+Returns discovered preview targets from the active manifest:
+
+```json
+{
+  "version": "0.1.0",
+  "appName": "MyApp",
+  "scheme": "MyApp",
+  "projectPath": "/path/to/MyApp.xcodeproj",
+  "manifestPath": "/path/to/manifests/MyApp.json",
+  "targets": [
+    {
+      "id": "settings-view",
+      "displayName": "Settings View",
+      "status": "placeholder",
+      "fixtures": [],
+      "supportedEnvironments": [
+        { "id": "light", "displayName": "Light", "colorScheme": "light", "localeIdentifier": "en_US", "dynamicTypeSize": "large" }
+      ]
+    }
+  ]
+}
+```
+
+Each target has a `status` field: `"placeholder"` for auto-generated adapter stubs that haven't been filled in yet, or `"configured"` for targets backed by a real view initializer.
+
 ### `GET /api/v1/config`
 
 Returns the active host app configuration the runtime will use for discovery, build, install, and launch:
@@ -92,9 +119,16 @@ Host apps that integrate `SwiftPreviewKit` should define preview targets in thei
 - `POST /api/v1/session/start`
 - `POST /api/v1/capture/snapshot`
 
+## Preview Adapters
+
+The "Set Up Previews" command generates preview adapter stubs — one function per discovered SwiftUI view — inside the host app's `@main` entry file. Each adapter is a static function in `SwiftUIExplorerPreviewAdapters` that initially renders a `ContentUnavailableView` placeholder. The developer replaces the placeholder body with a real view initializer, then updates the target's `status` from `"placeholder"` to `"configured"`.
+
+Adapter stubs accept a `SwiftUIExplorerPreviewContext` parameter that provides the selected fixture and environment, enabling fixture-based rendering from day one.
+
 ## Design Constraints
 
 - The extension should never shell out to `xcodebuild` directly.
 - The runtime should own all simulator process control.
 - Host apps should only need to implement the Swift preview registry contract, not editor-specific code.
 - Users should never need to manually author or select `PreviewManifest.json` — the manifest is generated from Swift code and auto-detected by the runtime.
+- The system does not attempt to auto-instantiate arbitrary views. Real rendering comes from explicit, app-owned adapter functions.

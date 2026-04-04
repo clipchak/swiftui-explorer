@@ -43,6 +43,7 @@ type PreviewEnvironment = {
 type PreviewDescriptor = {
   id: string;
   displayName: string;
+  status?: "placeholder" | "configured";
   fixtures: PreviewFixture[];
   supportedEnvironments: PreviewEnvironment[];
 };
@@ -237,7 +238,7 @@ export function activate(context: vscode.ExtensionContext): void {
         }
 
         vscode.window.showInformationMessage(
-          `Scaffolded ${result.targetCount} preview target${result.targetCount === 1 ? "" : "s"} in ${path.basename(result.appEntryFilePath)}.`,
+          `Generated ${result.targetCount} preview adapter${result.targetCount === 1 ? "" : "s"} in ${path.basename(result.appEntryFilePath)}. Fill in the adapter functions to render your real views.`,
         );
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown runtime error";
@@ -338,7 +339,7 @@ export function activate(context: vscode.ExtensionContext): void {
               panel.webview.postMessage({
                 type: "previewStatus",
                 kind: "success",
-                text: `Scaffolded ${result.targetCount} preview target${result.targetCount === 1 ? "" : "s"}.`,
+                text: `Generated ${result.targetCount} adapter stub${result.targetCount === 1 ? "" : "s"}. Fill in the adapter functions to render your real views.`,
               });
             } catch (error) {
               const messageText = error instanceof Error ? error.message : "Unknown runtime error";
@@ -724,7 +725,7 @@ async function setupPreviewsForConfiguredHostApp(
   );
 
   await vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: "Scaffolding preview integration..." },
+    { location: vscode.ProgressLocation.Notification, title: "Generating preview adapters..." },
     async () => {
       scaffoldPreviewsIntoAppEntryFile({
         appEntryPath: selectedAppEntry.filePath,
@@ -737,7 +738,7 @@ async function setupPreviewsForConfiguredHostApp(
   );
 
   await vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: "Writing starter preview manifest..." },
+    { location: vscode.ProgressLocation.Notification, title: "Writing preview manifest..." },
     async () => {
       writeStarterPreviewManifest(hostApp, normalizeProductName(productName ?? path.basename(hostApp.appRoot)), selectedViews);
     },
@@ -916,6 +917,7 @@ function writeStarterPreviewManifest(
     targets: selectedViews.map((view) => ({
       id: view.targetId,
       displayName: view.displayName,
+      status: "placeholder",
       fixtures: [],
       supportedEnvironments: [
         {
@@ -1031,28 +1033,30 @@ function upsertSwiftUIExplorerGeneratedBlock(contents: string, generatedBlock: s
 
 function generateSwiftUIExplorerGeneratedBlock(appStructName: string, selectedViews: ViewCandidate[]): string {
   const targetLines = selectedViews.map((view) => {
-    const rendererName = `render${sanitizeSwiftIdentifier(view.typeName)}`;
+    const adapterName = `render${sanitizeSwiftIdentifier(view.typeName)}`;
 
     return [
       "            SwiftUIExplorerPreviewTarget(",
       `                id: ${toSwiftStringLiteral(view.targetId)},`,
       `                displayName: ${toSwiftStringLiteral(view.displayName)}`,
-      "            ) { _ in",
-      `                SwiftUIExplorerGeneratedPreviewRenderer.${rendererName}()`,
+      "            ) { context in",
+      `                SwiftUIExplorerPreviewAdapters.${adapterName}(context)`,
       "            },",
     ].join("\n");
   }).join("\n");
 
-  const rendererLines = selectedViews.map((view) => {
-    const rendererName = `render${sanitizeSwiftIdentifier(view.typeName)}`;
+  const adapterLines = selectedViews.map((view) => {
+    const adapterName = `render${sanitizeSwiftIdentifier(view.typeName)}`;
 
     return [
+      `    // TODO: Replace the placeholder below with your real ${view.typeName} initializer.`,
+      `    //   Example: ${view.typeName}()`,
       "    @ViewBuilder",
-      `    static func ${rendererName}() -> some View {`,
+      `    static func ${adapterName}(_ context: SwiftUIExplorerPreviewContext) -> some View {`,
       "        ContentUnavailableView(",
-      `            ${toSwiftStringLiteral(`Connect ${view.displayName}`)},`,
-      '            systemImage: "wand.and.stars",',
-      `            description: Text(${toSwiftStringLiteral(`Replace this placeholder with a real ${view.typeName} initializer.`)})`,
+      `            ${toSwiftStringLiteral(view.displayName)},`,
+      '            systemImage: "puzzlepiece.extension",',
+      `            description: Text("Open this file and replace this adapter stub with a real ${view.typeName} initializer.")`,
       "        )",
       "    }",
     ].join("\n");
@@ -1167,6 +1171,7 @@ private struct SwiftUIExplorerPreviewEnvironment: Codable, Hashable, Identifiabl
 private struct SwiftUIExplorerPreviewDescriptor: Codable, Hashable {
     let id: String
     let displayName: String
+    let status: String
     let fixtures: [SwiftUIExplorerPreviewFixture]
     let supportedEnvironments: [SwiftUIExplorerPreviewEnvironment]
 }
@@ -1193,6 +1198,7 @@ private struct SwiftUIExplorerPreviewTarget: Identifiable {
     init<Content: View>(
         id: String,
         displayName: String,
+        status: String = "placeholder",
         fixtures: [SwiftUIExplorerPreviewFixture] = [],
         supportedEnvironments: [SwiftUIExplorerPreviewEnvironment] = SwiftUIExplorerPreviewEnvironment.defaults,
         @ViewBuilder render: @escaping @MainActor (SwiftUIExplorerPreviewContext) -> Content
@@ -1200,6 +1206,7 @@ private struct SwiftUIExplorerPreviewTarget: Identifiable {
         self.descriptor = SwiftUIExplorerPreviewDescriptor(
             id: id,
             displayName: displayName,
+            status: status,
             fixtures: fixtures,
             supportedEnvironments: supportedEnvironments
         )
@@ -1270,8 +1277,13 @@ private enum SwiftUIExplorerPreviewBootstrap {
     }
 }
 
-private enum SwiftUIExplorerGeneratedPreviewRenderer {
-${rendererLines}
+// MARK: - Preview Adapters
+// Each function below is a preview adapter stub. Replace the placeholder with your
+// real view initializer. The context parameter provides fixture and environment
+// selection so you can render different states of your view.
+
+private enum SwiftUIExplorerPreviewAdapters {
+${adapterLines}
 }
 
 private struct SwiftUIExplorerPreviewHostRootView: View {
@@ -1817,7 +1829,7 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
       <div class="buttonRow configHeader">
         <strong>Host App</strong>
         <div class="buttonRow">
-          <button id="setupButton">Set Up Previews</button>
+          <button id="setupButton">Generate Adapters</button>
           <button id="configureButton" class="secondary">Configure Host App</button>
         </div>
       </div>
@@ -1839,9 +1851,16 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
     }),
   );
 
+  const placeholderCount = discovery.targets.filter((target) => target.status === "placeholder").length;
+  const configuredCount = discovery.targets.length - placeholderCount;
+  const adapterStatusLine = placeholderCount > 0
+    ? `<p>${configuredCount} configured, ${placeholderCount} adapter stub${placeholderCount === 1 ? "" : "s"} remaining.</p>`
+    : `<p>All ${discovery.targets.length} adapter${discovery.targets.length === 1 ? "" : "s"} configured.</p>`;
+
   const targetSummary = discovery.targets.length > 0
     ? `
       <p>Discovered <strong>${discovery.targets.length}</strong> preview target${discovery.targets.length === 1 ? "" : "s"} from <code>${escapeHtml(discovery.appName ?? "unknown app")}</code>.</p>
+      ${adapterStatusLine}
       <p>Scheme: <code>${escapeHtml(discovery.scheme ?? "unknown")}</code></p>
       <p>Manifest: <code>${escapeHtml(discovery.manifestPath ?? "not found")}</code></p>
       <div class="controls">
@@ -1877,9 +1896,9 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
     : `
       <div class="detailCard">
         <p>No preview targets are available yet.</p>
-        <p>Run setup to scaffold starter preview targets into the configured app entry file.</p>
+        <p>Run setup to generate preview adapter stubs in your app entry file. Each adapter is a single function where you supply your real view initializer.</p>
         <div class="buttonRow">
-          <button id="emptySetupButton">Set Up Previews For This App</button>
+          <button id="emptySetupButton">Generate Preview Adapters</button>
         </div>
       </div>
     `;
@@ -1941,7 +1960,10 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
 
       function populateTargets() {
         targetSelect.innerHTML = targets
-          .map((target) => '<option value="' + escapeAttribute(target.id) + '">' + escapeText(target.displayName) + '</option>')
+          .map((target) => {
+            const suffix = target.status === 'placeholder' ? ' (stub)' : '';
+            return '<option value="' + escapeAttribute(target.id) + '">' + escapeText(target.displayName) + suffix + '</option>';
+          })
           .join("");
 
         const initialTargetId = storedSelection && storedSelection.targetId
@@ -2013,13 +2035,21 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
 
         const fixtures = (target.fixtures || []).map((fixture) => escapeText(fixture.displayName)).join(", ") || "No fixtures";
         const environments = (target.supportedEnvironments || []).map((environment) => escapeText(environment.displayName)).join(", ");
+        const isPlaceholder = target.status === "placeholder";
+        const statusBadge = isPlaceholder
+          ? '<span class="badge badge-placeholder">Adapter Stub</span>'
+          : '<span class="badge badge-configured">Configured</span>';
+        const adapterHint = isPlaceholder
+          ? '<div class="adapterHint">This target renders a placeholder. Open your app entry file and fill in the adapter function for <strong>' + escapeText(target.displayName) + '</strong> to render your real view.</div>'
+          : '';
 
         targetDetails.innerHTML =
           '<div class="detailCard">' +
-            '<h3>' + escapeText(target.displayName) + '</h3>' +
+            '<h3>' + escapeText(target.displayName) + ' ' + statusBadge + '</h3>' +
             '<div><code>' + escapeText(target.id) + '</code></div>' +
             '<div>Fixtures: ' + fixtures + '</div>' +
             '<div>Environments: ' + environments + '</div>' +
+            adapterHint +
           '</div>';
       }
 
@@ -2096,7 +2126,7 @@ function renderPanelHtml(snapshot: ExplorerSnapshot): string {
 
       function triggerSetupPreviews() {
         if (panelStatus) {
-          setStatus('pending', 'Scaffolding preview integration...');
+          setStatus('pending', 'Generating preview adapters...');
         }
         vscode.postMessage({
           type: 'setupPreviews',
@@ -2239,6 +2269,34 @@ function renderShell(content: string): string {
         align-items: center;
         justify-content: space-between;
         gap: 12px;
+      }
+
+      .badge {
+        display: inline-block;
+        font-size: 11px;
+        font-weight: 600;
+        padding: 2px 8px;
+        border-radius: 10px;
+        vertical-align: middle;
+      }
+
+      .badge-placeholder {
+        background: var(--vscode-editorWarning-foreground, #cca700);
+        color: var(--vscode-editor-background);
+      }
+
+      .badge-configured {
+        background: var(--vscode-testing-iconPassed, #73c991);
+        color: var(--vscode-editor-background);
+      }
+
+      .adapterHint {
+        margin-top: 10px;
+        padding: 8px 10px;
+        border-left: 3px solid var(--vscode-editorWarning-foreground, #cca700);
+        background: var(--vscode-textBlockQuote-background, rgba(127,127,127,.1));
+        font-size: 12px;
+        line-height: 1.5;
       }
     </style>
   </head>
